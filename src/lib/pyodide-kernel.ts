@@ -1,93 +1,50 @@
 import { CellOutput, Variable } from '@/types/notebook';
 
-// Pyodide types
-interface PyodideInterface {
-  runPythonAsync: (code: string) => Promise<unknown>;
-  loadPackagesFromImports: (code: string) => Promise<void>;
-  globals: {
-    get: (name: string) => unknown;
-    toJs: () => Map<string, unknown>;
-  };
-  FS: {
-    writeFile: (path: string, data: Uint8Array) => void;
-    readFile: (path: string, options?: { encoding: string }) => string | Uint8Array;
-  };
-  runPython: (code: string) => unknown;
-}
+// Worker instance
+let worker: Worker | null = null;
+let isReady = false;
+let initPromise: Promise<void> | null = null;
 
-declare global {
-  interface Window {
-    loadPyodide: (config?: { indexURL?: string }) => Promise<PyodideInterface>;
-  }
-}
+// Pending requests
+const pendingRequests = new Map<string, {
+  resolve: (value: unknown) => void;
+  reject: (error: Error) => void;
+}>();
 
-let pyodideInstance: PyodideInterface | null = null;
-let loadingPromise: Promise<PyodideInterface> | null = null;
+// Progress callback
+let progressCallback: ((message: string) => void) | null = null;
 
+// Generate unique request ID
+const generateRequestId = () => Math.random().toString(36).substring(2, 15);
+
+// Create and initialize the worker
+function createWorker(): Worker {
+  // Create worker using inline worker code for better compatibility
+  const workerCode = `
 const PYODIDE_CDN = 'https://cdn.jsdelivr.net/pyodide/v0.24.1/full/';
 
-// Helper to yield to main thread to prevent blocking
-const yieldToMain = () => new Promise<void>(resolve => {
-  // Use setTimeout with 0 for faster yielding while still allowing UI updates
-  setTimeout(resolve, 0);
-});
+let pyodide = null;
+const loadedPackages = new Set();
 
-// Longer yield for heavy operations
-const yieldToMainLong = () => new Promise<void>(resolve => {
-  if ('requestIdleCallback' in window) {
-    requestIdleCallback(() => resolve(), { timeout: 100 });
-  } else {
-    setTimeout(resolve, 16); // ~1 frame
-  }
-});
+async function initPyodide() {
+  try {
+    self.postMessage({ type: 'progress', message: 'Loading Pyodide runtime...' });
 
-export async function loadPyodideKernel(
-  onProgress?: (message: string) => void
-): Promise<PyodideInterface> {
-  if (pyodideInstance) {
-    return pyodideInstance;
-  }
+    importScripts(PYODIDE_CDN + 'pyodide.js');
 
-  if (loadingPromise) {
-    return loadingPromise;
-  }
-
-  loadingPromise = (async () => {
-    onProgress?.('Loading Pyodide runtime...');
+    self.postMessage({ type: 'progress', message: 'Initializing Python environment...' });
     
-    // Yield to allow UI to update
-    await yieldToMain();
-
-    // Load Pyodide script if not already loaded
-    if (!window.loadPyodide) {
-      await new Promise<void>((resolve, reject) => {
-        const script = document.createElement('script');
-        script.src = `${PYODIDE_CDN}pyodide.js`;
-        script.async = true;
-        script.onload = () => resolve();
-        script.onerror = () => reject(new Error('Failed to load Pyodide'));
-        document.head.appendChild(script);
-      });
-    }
-    
-    await yieldToMain();
-
-    onProgress?.('Initializing Python environment...');
-    pyodideInstance = await window.loadPyodide({
+    pyodide = await self.loadPyodide({
       indexURL: PYODIDE_CDN,
     });
-    
-    await yieldToMain();
 
-    // Setup basic Python environment first (fast)
-    onProgress?.('Setting up Python environment...');
-    
-    await pyodideInstance.runPythonAsync(`
+    self.postMessage({ type: 'progress', message: 'Setting up Python environment...' });
+
+    await pyodide.runPythonAsync(\`
 import sys
 import io
 import base64
 
-# Capture stdout
 class OutputCapture:
     def __init__(self):
         self.outputs = []
@@ -109,7 +66,6 @@ _output_capture = OutputCapture()
 sys.stdout = _output_capture
 sys.stderr = _output_capture
 
-# Matplotlib will be loaded lazily
 _matplotlib_loaded = False
 plt = None
 
@@ -124,7 +80,6 @@ def _ensure_matplotlib():
     return plt
 
 def _get_plot_as_base64():
-    """Get current matplotlib figure as base64 PNG"""
     global plt
     if plt is None:
         return None
@@ -139,117 +94,120 @@ def _get_plot_as_base64():
     return None
 
 def _get_output():
-    """Get captured stdout"""
     output = _output_capture.get_output()
     _output_capture.reset()
     return output
-`);
+\`);
 
-    onProgress?.('Python kernel ready!');
-    return pyodideInstance;
-  })();
-
-  return loadingPromise;
+    self.postMessage({ type: 'progress', message: 'Python kernel ready!' });
+    self.postMessage({ type: 'ready' });
+  } catch (error) {
+    self.postMessage({ 
+      type: 'error', 
+      error: error instanceof Error ? error.message : String(error) 
+    });
+  }
 }
 
-// Cache for loaded packages to avoid re-checking
-const loadedPackages = new Set<string>();
-
-export async function executeCode(code: string): Promise<CellOutput> {
-  const startTime = performance.now();
-
-  if (!pyodideInstance) {
-    throw new Error('Pyodide not initialized');
+async function executeCode(id, code) {
+  if (!pyodide) {
+    self.postMessage({ type: 'error', id, error: 'Pyodide not initialized' });
+    return;
   }
 
+  const startTime = performance.now();
+
   try {
-    // Yield before heavy operations
-    await yieldToMain();
-    
-    // Check if matplotlib is being used and ensure it's loaded
     const needsMatplotlib = code.includes('matplotlib') || code.includes('plt.') || code.includes('import plt');
     if (needsMatplotlib && !loadedPackages.has('matplotlib')) {
-      await pyodideInstance.loadPackagesFromImports('import matplotlib');
-      await pyodideInstance.runPythonAsync('_ensure_matplotlib()');
+      await pyodide.loadPackagesFromImports('import matplotlib');
+      await pyodide.runPythonAsync('_ensure_matplotlib()');
       loadedPackages.add('matplotlib');
-      await yieldToMainLong();
     }
     
-    // Check for numpy
     const needsNumpy = code.includes('numpy') || code.includes('np.');
     if (needsNumpy && !loadedPackages.has('numpy')) {
-      await pyodideInstance.loadPackagesFromImports('import numpy');
+      await pyodide.loadPackagesFromImports('import numpy');
       loadedPackages.add('numpy');
-      await yieldToMainLong();
     }
     
-    // Load any other required packages (but skip already loaded ones)
-    await pyodideInstance.loadPackagesFromImports(code);
-    await yieldToMain();
-
-    // Execute the code
-    const result = await pyodideInstance.runPythonAsync(code);
+    const needsPandas = code.includes('pandas') || code.includes('pd.');
+    if (needsPandas && !loadedPackages.has('pandas')) {
+      await pyodide.loadPackagesFromImports('import pandas');
+      loadedPackages.add('pandas');
+    }
     
-    // Yield after execution to allow UI updates
-    await yieldToMain();
+    await pyodide.loadPackagesFromImports(code);
 
-    // Get stdout output
-    const stdout = await pyodideInstance.runPythonAsync('_get_output()') as string;
+    const result = await pyodide.runPythonAsync(code);
 
-    // Check for matplotlib plots
-    const plotBase64 = await pyodideInstance.runPythonAsync('_get_plot_as_base64()') as string | null;
+    const stdout = await pyodide.runPythonAsync('_get_output()');
+
+    const plotBase64 = await pyodide.runPythonAsync('_get_plot_as_base64()');
 
     const executionTime = performance.now() - startTime;
 
     if (plotBase64) {
-      return {
-        type: 'plot',
-        content: '',
-        executionTime,
-        data: {
-          'image/png': plotBase64,
+      self.postMessage({
+        type: 'executeResult',
+        id,
+        result: {
+          type: 'plot',
+          content: '',
+          executionTime,
+          data: {
+            'image/png': plotBase64,
+          },
         },
-      };
+      });
+      return;
     }
 
-    // Format the result
     let outputContent = stdout;
     if (result !== undefined && result !== null) {
       const resultStr = String(result);
       if (resultStr !== 'None' && resultStr !== 'undefined') {
-        outputContent = outputContent ? `${outputContent}\n${resultStr}` : resultStr;
+        outputContent = outputContent ? outputContent + '\\n' + resultStr : resultStr;
       }
     }
 
-    return {
-      type: 'text',
-      content: outputContent || '',
-      executionTime,
-    };
+    self.postMessage({
+      type: 'executeResult',
+      id,
+      result: {
+        type: 'text',
+        content: outputContent || '',
+        executionTime,
+      },
+    });
   } catch (error) {
     const executionTime = performance.now() - startTime;
     const errorMessage = error instanceof Error ? error.message : String(error);
     
-    // Clean up the error message
     const cleanError = errorMessage
       .replace(/PythonError: /g, '')
-      .replace(/Traceback \(most recent call last\):/g, 'Traceback (most recent call last):');
+      .replace(/Traceback \\(most recent call last\\):/g, 'Traceback (most recent call last):');
 
-    return {
-      type: 'error',
-      content: cleanError,
-      executionTime,
-    };
+    self.postMessage({
+      type: 'executeResult',
+      id,
+      result: {
+        type: 'error',
+        content: cleanError,
+        executionTime,
+      },
+    });
   }
 }
 
-export async function getVariables(): Promise<Variable[]> {
-  if (!pyodideInstance) {
-    return [];
+async function getVariables(id) {
+  if (!pyodide) {
+    self.postMessage({ type: 'variablesResult', id, variables: [] });
+    return;
   }
 
   try {
-    const result = await pyodideInstance.runPythonAsync(`
+    const result = await pyodide.runPythonAsync(\`
 import json
 
 def _get_variables():
@@ -259,14 +217,12 @@ def _get_variables():
             try:
                 var_type = type(value).__name__
                 
-                # Get size for arrays/lists
                 size = None
                 if hasattr(value, 'shape'):
                     size = str(value.shape)
                 elif hasattr(value, '__len__') and not isinstance(value, str):
                     size = f"{len(value)} items"
                 
-                # Get string representation (truncated)
                 try:
                     val_str = repr(value)
                     if len(val_str) > 100:
@@ -285,32 +241,236 @@ def _get_variables():
     return json.dumps(variables)
 
 _get_variables()
-`) as string;
+\`);
 
-    return JSON.parse(result);
+    self.postMessage({ type: 'variablesResult', id, variables: JSON.parse(result) });
   } catch {
-    return [];
+    self.postMessage({ type: 'variablesResult', id, variables: [] });
   }
 }
 
-export async function restartKernel(): Promise<void> {
-  if (pyodideInstance) {
-    // Clear all user-defined variables
-    await pyodideInstance.runPythonAsync(`
-# Clear user variables
+async function restartKernel(id) {
+  if (!pyodide) {
+    self.postMessage({ type: 'restartComplete', id });
+    return;
+  }
+
+  try {
+    await pyodide.runPythonAsync(\`
 for name in list(globals().keys()):
     if not name.startswith('_') and name not in ['sys', 'io', 'base64', 'matplotlib', 'plt', 'json', 'OutputCapture']:
         del globals()[name]
 
-# Reset output capture
 _output_capture.reset()
 
-# Close all plots
-plt.close('all')
-`);
+if plt is not None:
+    plt.close('all')
+\`);
+    self.postMessage({ type: 'restartComplete', id });
+  } catch (error) {
+    self.postMessage({ 
+      type: 'error', 
+      id, 
+      error: error instanceof Error ? error.message : String(error) 
+    });
   }
 }
 
+self.onmessage = async (event) => {
+  const message = event.data;
+
+  switch (message.type) {
+    case 'init':
+      await initPyodide();
+      break;
+    case 'execute':
+      await executeCode(message.id, message.code);
+      break;
+    case 'getVariables':
+      await getVariables(message.id);
+      break;
+    case 'restart':
+      await restartKernel(message.id);
+      break;
+  }
+};
+`;
+
+  const blob = new Blob([workerCode], { type: 'application/javascript' });
+  const workerUrl = URL.createObjectURL(blob);
+  const newWorker = new Worker(workerUrl);
+  
+  newWorker.onmessage = (event) => {
+    const message = event.data;
+    
+    switch (message.type) {
+      case 'progress':
+        progressCallback?.(message.message);
+        break;
+        
+      case 'ready':
+        isReady = true;
+        break;
+        
+      case 'executeResult': {
+        const pending = pendingRequests.get(message.id);
+        if (pending) {
+          pending.resolve(message.result);
+          pendingRequests.delete(message.id);
+        }
+        break;
+      }
+      
+      case 'variablesResult': {
+        const pending = pendingRequests.get(message.id);
+        if (pending) {
+          pending.resolve(message.variables);
+          pendingRequests.delete(message.id);
+        }
+        break;
+      }
+      
+      case 'restartComplete': {
+        const pending = pendingRequests.get(message.id);
+        if (pending) {
+          pending.resolve(undefined);
+          pendingRequests.delete(message.id);
+        }
+        break;
+      }
+      
+      case 'error': {
+        if (message.id) {
+          const pending = pendingRequests.get(message.id);
+          if (pending) {
+            pending.reject(new Error(message.error));
+            pendingRequests.delete(message.id);
+          }
+        } else {
+          console.error('Worker error:', message.error);
+        }
+        break;
+      }
+    }
+  };
+  
+  newWorker.onerror = (error) => {
+    console.error('Worker error:', error);
+    // Reject all pending requests
+    pendingRequests.forEach((pending) => {
+      pending.reject(new Error('Worker error'));
+    });
+    pendingRequests.clear();
+  };
+  
+  return newWorker;
+}
+
+export async function loadPyodideKernel(
+  onProgress?: (message: string) => void
+): Promise<void> {
+  if (isReady && worker) {
+    return;
+  }
+
+  if (initPromise) {
+    return initPromise;
+  }
+
+  progressCallback = onProgress || null;
+
+  initPromise = new Promise<void>((resolve, reject) => {
+    try {
+      worker = createWorker();
+      
+      // Set up a one-time listener for the ready message
+      const readyHandler = (event: MessageEvent) => {
+        if (event.data.type === 'ready') {
+          isReady = true;
+          resolve();
+        } else if (event.data.type === 'error' && !event.data.id) {
+          reject(new Error(event.data.error));
+        }
+      };
+      
+      // The main onmessage handler will also catch 'ready', but we need this for the promise
+      const originalOnMessage = worker.onmessage;
+      worker.onmessage = (event) => {
+        readyHandler(event);
+        if (originalOnMessage) {
+          originalOnMessage.call(worker, event);
+        }
+      };
+      
+      // Start initialization
+      worker.postMessage({ type: 'init' });
+    } catch (error) {
+      reject(error);
+    }
+  });
+
+  return initPromise;
+}
+
+export async function executeCode(code: string): Promise<CellOutput> {
+  if (!worker || !isReady) {
+    throw new Error('Pyodide not initialized');
+  }
+
+  const id = generateRequestId();
+  
+  return new Promise((resolve, reject) => {
+    pendingRequests.set(id, { 
+      resolve: resolve as (value: unknown) => void, 
+      reject 
+    });
+    worker!.postMessage({ type: 'execute', id, code });
+  });
+}
+
+export async function getVariables(): Promise<Variable[]> {
+  if (!worker || !isReady) {
+    return [];
+  }
+
+  const id = generateRequestId();
+  
+  return new Promise((resolve, reject) => {
+    pendingRequests.set(id, { 
+      resolve: resolve as (value: unknown) => void, 
+      reject 
+    });
+    worker!.postMessage({ type: 'getVariables', id });
+  });
+}
+
+export async function restartKernel(): Promise<void> {
+  if (!worker || !isReady) {
+    return;
+  }
+
+  const id = generateRequestId();
+  
+  return new Promise((resolve, reject) => {
+    pendingRequests.set(id, { 
+      resolve: resolve as (value: unknown) => void, 
+      reject 
+    });
+    worker!.postMessage({ type: 'restart', id });
+  });
+}
+
 export function isKernelLoaded(): boolean {
-  return pyodideInstance !== null;
+  return isReady && worker !== null;
+}
+
+// Terminate the worker (for cleanup)
+export function terminateKernel(): void {
+  if (worker) {
+    worker.terminate();
+    worker = null;
+    isReady = false;
+    initPromise = null;
+    pendingRequests.clear();
+  }
 }

@@ -91,16 +91,8 @@ export function useNotebook() {
       }
     };
 
-    // Delay kernel initialization to let UI render first
-    const timeoutId = setTimeout(() => {
-      if ('requestIdleCallback' in window) {
-        requestIdleCallback(() => initKernel(), { timeout: 2000 });
-      } else {
-        initKernel();
-      }
-    }, 100);
-    
-    return () => clearTimeout(timeoutId);
+    // Initialize kernel (runs in Web Worker, so it won't block UI)
+    initKernel();
   }, []);
 
   // Auto-save every 30 seconds
@@ -265,11 +257,8 @@ export function useNotebook() {
         };
       });
 
-      // Allow UI to update before starting execution
-      await new Promise(resolve => setTimeout(resolve, 0));
-
       try {
-        // Execute code using Pyodide with latest content
+        // Execute code using Pyodide with latest content (runs in Web Worker, non-blocking)
         const output = await executeCode(latestContent);
 
         // Get updated variables
