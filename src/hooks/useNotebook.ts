@@ -1,5 +1,5 @@
 import { useState, useCallback, useEffect, useRef } from 'react';
-import { Cell, CellType, NotebookState, Variable } from '@/types/notebook';
+import { Cell, CellType, NotebookState } from '@/types/notebook';
 import {
   loadPyodideKernel,
   executeCode,
@@ -64,8 +64,12 @@ export function useNotebook() {
   const [state, setState] = useState<NotebookState>(getInitialState);
   const autoSaveRef = useRef<NodeJS.Timeout | null>(null);
   const [kernelLoadingMessage, setKernelLoadingMessage] = useState<string>('');
+  
+  // Keep a ref to current state for callbacks to avoid stale closures
+  const stateRef = useRef(state);
+  stateRef.current = state;
 
-  // Initialize Pyodide kernel on mount
+  // Initialize Pyodide kernel on mount with delay to let UI render first
   useEffect(() => {
     const initKernel = async () => {
       if (isKernelLoaded()) {
@@ -87,7 +91,16 @@ export function useNotebook() {
       }
     };
 
-    initKernel();
+    // Delay kernel initialization to let UI render first
+    const timeoutId = setTimeout(() => {
+      if ('requestIdleCallback' in window) {
+        requestIdleCallback(() => initKernel(), { timeout: 2000 });
+      } else {
+        initKernel();
+      }
+    }, 100);
+    
+    return () => clearTimeout(timeoutId);
   }, []);
 
   // Auto-save every 30 seconds
@@ -199,11 +212,14 @@ export function useNotebook() {
 
   const executeCell = useCallback(
     async (cellId: string, advance: boolean = true) => {
-      const cell = state.cells.find((c) => c.id === cellId);
+      // Use ref to get current cells to avoid stale closure
+      const currentCells = stateRef.current.cells;
+
+      const cell = currentCells.find((c) => c.id === cellId);
       if (!cell || cell.type === 'markdown') {
         if (advance) {
-          const index = state.cells.findIndex((c) => c.id === cellId);
-          const nextCell = state.cells[index + 1];
+          const index = currentCells.findIndex((c) => c.id === cellId);
+          const nextCell = currentCells[index + 1];
           if (nextCell) {
             setActiveCell(nextCell.id);
           } else {
@@ -233,48 +249,63 @@ export function useNotebook() {
         return;
       }
 
-      // Set running state
-      setState((prev) => ({
-        ...prev,
-        kernelStatus: 'busy',
-        cells: prev.cells.map((c) =>
-          c.id === cellId ? { ...c, status: 'running', output: undefined } : c
-        ),
-      }));
+      // Set running state and get latest content
+      let latestContent = cell.content;
+      setState((prev) => {
+        const latestCell = prev.cells.find((c) => c.id === cellId);
+        if (latestCell) {
+          latestContent = latestCell.content;
+        }
+        return {
+          ...prev,
+          kernelStatus: 'busy',
+          cells: prev.cells.map((c) =>
+            c.id === cellId ? { ...c, status: 'running', output: undefined } : c
+          ),
+        };
+      });
+
+      // Allow UI to update before starting execution
+      await new Promise(resolve => setTimeout(resolve, 0));
 
       try {
-        // Execute code using Pyodide
-        const output = await executeCode(cell.content);
+        // Execute code using Pyodide with latest content
+        const output = await executeCode(latestContent);
 
         // Get updated variables
         const variables = await getVariables();
 
-        setState((prev) => ({
-          ...prev,
-          kernelStatus: 'idle',
-          executionCounter: prev.executionCounter + 1,
-          variables,
-          cells: prev.cells.map((c) =>
-            c.id === cellId
-              ? {
-                  ...c,
-                  status: output.type === 'error' ? 'error' : 'success',
-                  output,
-                  executionCount: prev.executionCounter + 1,
-                }
-              : c
-          ),
-        }));
-
-        if (advance) {
-          const index = state.cells.findIndex((c) => c.id === cellId);
-          const nextCell = state.cells[index + 1];
-          if (nextCell) {
-            setActiveCell(nextCell.id);
-          } else {
-            addCell(cellId);
+        setState((prev) => {
+          // Handle advance logic inside setState to use latest state
+          if (advance) {
+            const index = prev.cells.findIndex((c) => c.id === cellId);
+            const nextCell = prev.cells[index + 1];
+            if (nextCell) {
+              // Schedule setActiveCell after state update
+              setTimeout(() => setActiveCell(nextCell.id), 0);
+            } else {
+              // Schedule addCell after state update
+              setTimeout(() => addCell(cellId), 0);
+            }
           }
-        }
+
+          return {
+            ...prev,
+            kernelStatus: 'idle',
+            executionCounter: prev.executionCounter + 1,
+            variables,
+            cells: prev.cells.map((c) =>
+              c.id === cellId
+                ? {
+                    ...c,
+                    status: output.type === 'error' ? 'error' : 'success',
+                    output,
+                    executionCount: prev.executionCounter + 1,
+                  }
+                : c
+            ),
+          };
+        });
       } catch (error) {
         setState((prev) => ({
           ...prev,

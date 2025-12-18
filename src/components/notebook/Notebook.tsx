@@ -158,12 +158,13 @@ export function Notebook() {
                   >
                     <NotebookCell
                       cell={cell}
+                      cellId={cell.id}
                       isActive={activeCellId === cell.id}
                       index={index}
                       totalCells={cells.length}
                       onActivate={() => setActiveCell(cell.id)}
                       onUpdateContent={(content) => updateCellContent(cell.id, content)}
-                      onExecute={(advance) => executeCell(cell.id, advance)}
+                      onExecute={executeCell}
                       onDelete={() => deleteCell(cell.id)}
                       onMoveUp={() => moveCell(cell.id, 'up')}
                       onMoveDown={() => moveCell(cell.id, 'down')}

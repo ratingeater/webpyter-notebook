@@ -26,6 +26,21 @@ let loadingPromise: Promise<PyodideInterface> | null = null;
 
 const PYODIDE_CDN = 'https://cdn.jsdelivr.net/pyodide/v0.24.1/full/';
 
+// Helper to yield to main thread to prevent blocking
+const yieldToMain = () => new Promise<void>(resolve => {
+  // Use setTimeout with 0 for faster yielding while still allowing UI updates
+  setTimeout(resolve, 0);
+});
+
+// Longer yield for heavy operations
+const yieldToMainLong = () => new Promise<void>(resolve => {
+  if ('requestIdleCallback' in window) {
+    requestIdleCallback(() => resolve(), { timeout: 100 });
+  } else {
+    setTimeout(resolve, 16); // ~1 frame
+  }
+});
+
 export async function loadPyodideKernel(
   onProgress?: (message: string) => void
 ): Promise<PyodideInterface> {
@@ -39,36 +54,38 @@ export async function loadPyodideKernel(
 
   loadingPromise = (async () => {
     onProgress?.('Loading Pyodide runtime...');
+    
+    // Yield to allow UI to update
+    await yieldToMain();
 
     // Load Pyodide script if not already loaded
     if (!window.loadPyodide) {
       await new Promise<void>((resolve, reject) => {
         const script = document.createElement('script');
         script.src = `${PYODIDE_CDN}pyodide.js`;
+        script.async = true;
         script.onload = () => resolve();
         script.onerror = () => reject(new Error('Failed to load Pyodide'));
         document.head.appendChild(script);
       });
     }
+    
+    await yieldToMain();
 
     onProgress?.('Initializing Python environment...');
     pyodideInstance = await window.loadPyodide({
       indexURL: PYODIDE_CDN,
     });
+    
+    await yieldToMain();
 
-    // Setup matplotlib for inline display
-    onProgress?.('Setting up matplotlib...');
-    await pyodideInstance.loadPackagesFromImports('import matplotlib');
+    // Setup basic Python environment first (fast)
+    onProgress?.('Setting up Python environment...');
     
     await pyodideInstance.runPythonAsync(`
 import sys
 import io
 import base64
-
-# Setup matplotlib for inline display
-import matplotlib
-matplotlib.use('AGG')
-import matplotlib.pyplot as plt
 
 # Capture stdout
 class OutputCapture:
@@ -92,8 +109,25 @@ _output_capture = OutputCapture()
 sys.stdout = _output_capture
 sys.stderr = _output_capture
 
+# Matplotlib will be loaded lazily
+_matplotlib_loaded = False
+plt = None
+
+def _ensure_matplotlib():
+    global _matplotlib_loaded, plt
+    if not _matplotlib_loaded:
+        import matplotlib
+        matplotlib.use('AGG')
+        import matplotlib.pyplot as _plt
+        plt = _plt
+        _matplotlib_loaded = True
+    return plt
+
 def _get_plot_as_base64():
     """Get current matplotlib figure as base64 PNG"""
+    global plt
+    if plt is None:
+        return None
     if plt.get_fignums():
         buf = io.BytesIO()
         plt.savefig(buf, format='png', dpi=100, bbox_inches='tight', 
@@ -118,6 +152,9 @@ def _get_output():
   return loadingPromise;
 }
 
+// Cache for loaded packages to avoid re-checking
+const loadedPackages = new Set<string>();
+
 export async function executeCode(code: string): Promise<CellOutput> {
   const startTime = performance.now();
 
@@ -126,11 +163,35 @@ export async function executeCode(code: string): Promise<CellOutput> {
   }
 
   try {
-    // Load any required packages
+    // Yield before heavy operations
+    await yieldToMain();
+    
+    // Check if matplotlib is being used and ensure it's loaded
+    const needsMatplotlib = code.includes('matplotlib') || code.includes('plt.') || code.includes('import plt');
+    if (needsMatplotlib && !loadedPackages.has('matplotlib')) {
+      await pyodideInstance.loadPackagesFromImports('import matplotlib');
+      await pyodideInstance.runPythonAsync('_ensure_matplotlib()');
+      loadedPackages.add('matplotlib');
+      await yieldToMainLong();
+    }
+    
+    // Check for numpy
+    const needsNumpy = code.includes('numpy') || code.includes('np.');
+    if (needsNumpy && !loadedPackages.has('numpy')) {
+      await pyodideInstance.loadPackagesFromImports('import numpy');
+      loadedPackages.add('numpy');
+      await yieldToMainLong();
+    }
+    
+    // Load any other required packages (but skip already loaded ones)
     await pyodideInstance.loadPackagesFromImports(code);
+    await yieldToMain();
 
     // Execute the code
     const result = await pyodideInstance.runPythonAsync(code);
+    
+    // Yield after execution to allow UI updates
+    await yieldToMain();
 
     // Get stdout output
     const stdout = await pyodideInstance.runPythonAsync('_get_output()') as string;

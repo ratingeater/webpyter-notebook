@@ -9,12 +9,13 @@ import { cn } from '@/lib/utils';
 
 interface NotebookCellProps {
   cell: Cell;
+  cellId: string;
   isActive: boolean;
   index: number;
   totalCells: number;
   onActivate: () => void;
   onUpdateContent: (content: string) => void;
-  onExecute: (advance: boolean) => void;
+  onExecute: (cellId: string, advance: boolean) => void;
   onDelete: () => void;
   onMoveUp: () => void;
   onMoveDown: () => void;
@@ -31,6 +32,7 @@ interface NotebookCellProps {
 
 export function NotebookCell({
   cell,
+  cellId,
   isActive,
   index,
   totalCells,
@@ -87,7 +89,7 @@ export function NotebookCell({
       {/* Cell toolbar */}
       <CellToolbar
         cellType={cell.type}
-        onRun={() => onExecute(true)}
+        onRun={() => onExecute(cellId, true)}
         onDelete={onDelete}
         onMoveUp={onMoveUp}
         onMoveDown={onMoveDown}
@@ -103,7 +105,8 @@ export function NotebookCell({
           <CodeEditor
             value={cell.content}
             onChange={onUpdateContent}
-            onExecute={onExecute}
+            onExecute={(advance) => onExecute(cellId, advance)}
+            onFocus={onActivate}
             isActive={isActive}
             fontSize={editorSettings?.fontSize}
             tabSize={editorSettings?.tabSize}
@@ -119,12 +122,12 @@ export function NotebookCell({
                 if (e.key === 'Enter' && e.shiftKey) {
                   e.preventDefault();
                   setIsEditing(false);
-                  onExecute(true);
+                  onExecute(cellId, true);
                 }
                 if (e.key === 'Enter' && e.ctrlKey) {
                   e.preventDefault();
                   setIsEditing(false);
-                  onExecute(false);
+                  onExecute(cellId, false);
                 }
                 if (e.key === 'Escape') {
                   setIsEditing(false);

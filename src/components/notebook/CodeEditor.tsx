@@ -5,7 +5,10 @@ import type { editor } from 'monaco-editor';
 // Configure Monaco loader to avoid module loading issues
 loader.config({
   paths: {
-    vs: 'https://cdn.jsdelivr.net/npm/monaco-editor@0.45.0/min/vs',
+    vs: 'https://cdn.jsdelivr.net/npm/monaco-editor@0.43.0/min/vs',
+  },
+  'vs/nls': {
+    availableLanguages: {},
   },
 });
 
@@ -13,6 +16,7 @@ interface CodeEditorProps {
   value: string;
   onChange: (value: string) => void;
   onExecute: (advance: boolean) => void;
+  onFocus?: () => void;
   isActive: boolean;
   language?: string;
   fontSize?: number;
@@ -25,6 +29,7 @@ export function CodeEditor({
   value,
   onChange,
   onExecute,
+  onFocus,
   isActive,
   language = 'python',
   fontSize = 14,
@@ -33,6 +38,18 @@ export function CodeEditor({
   lineNumbers = true,
 }: CodeEditorProps) {
   const editorRef = useRef<editor.IStandaloneCodeEditor | null>(null);
+  // Use ref to always have the latest onExecute callback
+  const onExecuteRef = useRef(onExecute);
+  const onFocusRef = useRef(onFocus);
+  
+  // Keep the refs updated with the latest callbacks
+  useEffect(() => {
+    onExecuteRef.current = onExecute;
+  }, [onExecute]);
+  
+  useEffect(() => {
+    onFocusRef.current = onFocus;
+  }, [onFocus]);
 
   const handleEditorMount: OnMount = (editor, monaco) => {
     editorRef.current = editor;
@@ -67,13 +84,20 @@ export function CodeEditor({
 
     monaco.editor.setTheme('jupyter-dark');
 
-    // Add keyboard shortcuts
+    // Add keyboard shortcuts - use ref to always get latest callback
     editor.addCommand(monaco.KeyMod.Shift | monaco.KeyCode.Enter, () => {
-      onExecute(true);
+      onExecuteRef.current(true);
     });
 
     editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.Enter, () => {
-      onExecute(false);
+      onExecuteRef.current(false);
+    });
+    
+    // Listen for focus events to activate the cell
+    editor.onDidFocusEditorWidget(() => {
+      if (onFocusRef.current) {
+        onFocusRef.current();
+      }
     });
   };
 
