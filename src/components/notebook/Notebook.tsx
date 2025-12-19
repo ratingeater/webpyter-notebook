@@ -98,14 +98,11 @@ export function Notebook() {
 
   return (
     <div className="h-screen w-screen flex flex-col overflow-hidden bg-[var(--jupyter-bg)]">
-      {/* Kernel loading overlay */}
+      {/* Kernel loading indicator - non-blocking banner */}
       {kernelStatus === 'loading' && (
-        <div className="absolute inset-0 z-50 bg-[var(--jupyter-bg)]/90 flex items-center justify-center">
-          <div className="text-center">
-            <div className="w-12 h-12 border-4 border-[var(--jupyter-accent)] border-t-transparent rounded-full animate-spin mx-auto mb-4" />
-            <p className="font-ui text-foreground">{kernelLoadingMessage || 'Loading Python kernel...'}</p>
-            <p className="font-ui text-sm text-muted-foreground mt-2">This may take a moment on first load</p>
-          </div>
+        <div className="absolute top-16 left-1/2 -translate-x-1/2 z-50 bg-[var(--jupyter-surface)] border border-[var(--jupyter-border)] rounded-lg px-4 py-2 shadow-lg flex items-center gap-3">
+          <div className="w-4 h-4 border-2 border-[var(--jupyter-accent)] border-t-transparent rounded-full animate-spin" />
+          <span className="font-ui text-sm text-foreground">{kernelLoadingMessage || 'Loading Python kernel...'}</span>
         </div>
       )}
 

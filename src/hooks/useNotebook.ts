@@ -69,7 +69,7 @@ export function useNotebook() {
   const stateRef = useRef(state);
   stateRef.current = state;
 
-  // Initialize Pyodide kernel on mount with delay to let UI render first
+  // Initialize Pyodide kernel on mount - delayed start for faster initial render
   useEffect(() => {
     const initKernel = async () => {
       if (isKernelLoaded()) {
@@ -77,21 +77,29 @@ export function useNotebook() {
         return;
       }
 
-      setState((prev) => ({ ...prev, kernelStatus: 'loading' }));
-      try {
-        await loadPyodideKernel((message) => {
+      // Delay kernel loading to let UI render first (use requestIdleCallback if available)
+      const startLoading = () => {
+        setState((prev) => ({ ...prev, kernelStatus: 'loading' }));
+        loadPyodideKernel((message) => {
           setKernelLoadingMessage(message);
+        }).then(() => {
+          setState((prev) => ({ ...prev, kernelStatus: 'idle' }));
+          setKernelLoadingMessage('');
+        }).catch((error) => {
+          console.error('Failed to load Pyodide:', error);
+          setState((prev) => ({ ...prev, kernelStatus: 'disconnected' }));
+          setKernelLoadingMessage('Failed to load Python kernel');
         });
-        setState((prev) => ({ ...prev, kernelStatus: 'idle' }));
-        setKernelLoadingMessage('');
-      } catch (error) {
-        console.error('Failed to load Pyodide:', error);
-        setState((prev) => ({ ...prev, kernelStatus: 'disconnected' }));
-        setKernelLoadingMessage('Failed to load Python kernel');
+      };
+
+      // Use requestIdleCallback for non-blocking initialization, fallback to setTimeout
+      if ('requestIdleCallback' in window) {
+        (window as unknown as { requestIdleCallback: (cb: () => void) => void }).requestIdleCallback(startLoading);
+      } else {
+        setTimeout(startLoading, 100);
       }
     };
 
-    // Initialize kernel (runs in Web Worker, so it won't block UI)
     initKernel();
   }, []);
 

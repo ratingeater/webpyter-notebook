@@ -72,6 +72,8 @@ export function StatusBar({
     switch (kernelStatus) {
       case 'loading':
         return 'Loading Pyodide...';
+      case 'busy':
+        return 'Running (CPU intensive)';
       default:
         return kernelStatus;
     }

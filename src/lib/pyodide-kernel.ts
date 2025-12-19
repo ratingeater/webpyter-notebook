@@ -118,25 +118,28 @@ async function executeCode(id, code) {
   const startTime = performance.now();
 
   try {
+    // Check for package imports upfront and load in parallel where possible
     const needsMatplotlib = code.includes('matplotlib') || code.includes('plt.') || code.includes('import plt');
-    if (needsMatplotlib && !loadedPackages.has('matplotlib')) {
-      await pyodide.loadPackagesFromImports('import matplotlib');
-      await pyodide.runPythonAsync('_ensure_matplotlib()');
-      loadedPackages.add('matplotlib');
-    }
-    
     const needsNumpy = code.includes('numpy') || code.includes('np.');
-    if (needsNumpy && !loadedPackages.has('numpy')) {
-      await pyodide.loadPackagesFromImports('import numpy');
-      loadedPackages.add('numpy');
-    }
-    
     const needsPandas = code.includes('pandas') || code.includes('pd.');
-    if (needsPandas && !loadedPackages.has('pandas')) {
-      await pyodide.loadPackagesFromImports('import pandas');
-      loadedPackages.add('pandas');
+    
+    // Batch load packages that are needed
+    const packagesToLoad = [];
+    if (needsNumpy && !loadedPackages.has('numpy')) packagesToLoad.push('numpy');
+    if (needsMatplotlib && !loadedPackages.has('matplotlib')) packagesToLoad.push('matplotlib');
+    if (needsPandas && !loadedPackages.has('pandas')) packagesToLoad.push('pandas');
+    
+    // Load all needed packages at once if any
+    if (packagesToLoad.length > 0) {
+      await pyodide.loadPackagesFromImports('import ' + packagesToLoad.join(', import '));
+      packagesToLoad.forEach(pkg => loadedPackages.add(pkg));
+      
+      if (needsMatplotlib && packagesToLoad.includes('matplotlib')) {
+        await pyodide.runPythonAsync('_ensure_matplotlib()');
+      }
     }
     
+    // Only load additional packages if code has explicit imports not already loaded
     await pyodide.loadPackagesFromImports(code);
 
     const result = await pyodide.runPythonAsync(code);
