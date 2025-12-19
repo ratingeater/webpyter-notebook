@@ -1,12 +1,7 @@
 import { useState, useCallback, useEffect, useRef } from 'react';
 import { Cell, CellType, NotebookState } from '@/types/notebook';
-import {
-  loadPyodideKernel,
-  executeCode,
-  getVariables,
-  restartKernel as restartPyodideKernel,
-  isKernelLoaded,
-} from '@/lib/pyodide-kernel';
+import type { KernelClient } from '@/lib/kernel-client';
+import { selectKernelClient } from '@/lib/kernel-manager';
 import {
   getNotebook,
   saveNotebook,
@@ -64,35 +59,34 @@ export function useNotebook() {
   const [state, setState] = useState<NotebookState>(getInitialState);
   const autoSaveRef = useRef<NodeJS.Timeout | null>(null);
   const [kernelLoadingMessage, setKernelLoadingMessage] = useState<string>('');
-  
+  const kernelClientRef = useRef<KernelClient | null>(null);
+  const kernelKindRef = useRef<'backend' | 'pyodide' | null>(null);
+
   // Keep a ref to current state for callbacks to avoid stale closures
   const stateRef = useRef(state);
   stateRef.current = state;
 
-  // Initialize Pyodide kernel on mount - delayed start for faster initial render
+  // Initialize kernel on mount (prefer backend; fallback to Pyodide)
   useEffect(() => {
     const initKernel = async () => {
-      if (isKernelLoaded()) {
-        setState((prev) => ({ ...prev, kernelStatus: 'idle' }));
-        return;
-      }
-
       // Delay kernel loading to let UI render first (use requestIdleCallback if available)
       const startLoading = () => {
         setState((prev) => ({ ...prev, kernelStatus: 'loading' }));
-        loadPyodideKernel((message) => {
-          setKernelLoadingMessage(message);
-        }).then(() => {
-          setState((prev) => ({ ...prev, kernelStatus: 'idle' }));
-          setKernelLoadingMessage('');
-        }).catch((error) => {
-          console.error('Failed to load Pyodide:', error);
-          setState((prev) => ({ ...prev, kernelStatus: 'disconnected' }));
-          setKernelLoadingMessage('Failed to load Python kernel');
-        });
+
+        selectKernelClient((message) => setKernelLoadingMessage(message))
+          .then((client) => {
+            kernelClientRef.current = client;
+            kernelKindRef.current = client.kind;
+            setState((prev) => ({ ...prev, kernelStatus: 'idle' }));
+            setKernelLoadingMessage('');
+          })
+          .catch((error) => {
+            console.error('Failed to initialize kernel:', error);
+            setState((prev) => ({ ...prev, kernelStatus: 'disconnected' }));
+            setKernelLoadingMessage('Failed to load Python kernel');
+          });
       };
 
-      // Use requestIdleCallback for non-blocking initialization, fallback to setTimeout
       if ('requestIdleCallback' in window) {
         (window as unknown as { requestIdleCallback: (cb: () => void) => void }).requestIdleCallback(startLoading);
       } else {
@@ -229,8 +223,8 @@ export function useNotebook() {
         return;
       }
 
-      // Check if kernel is loaded
-      if (!isKernelLoaded()) {
+      const kernel = kernelClientRef.current;
+      if (!kernel || !kernel.isLoaded()) {
         setState((prev) => ({
           ...prev,
           cells: prev.cells.map((c) =>
@@ -266,11 +260,14 @@ export function useNotebook() {
       });
 
       try {
-        // Execute code using Pyodide with latest content (runs in Web Worker, non-blocking)
-        const output = await executeCode(latestContent);
+        const kernel = kernelClientRef.current;
+        if (!kernel) throw new Error('Kernel not initialized');
+
+        // Execute code (backend preferred, Pyodide fallback)
+        const output = await kernel.execute(latestContent);
 
         // Get updated variables
-        const variables = await getVariables();
+        const variables = await kernel.getVariables();
 
         setState((prev) => {
           // Handle advance logic inside setState to use latest state
@@ -340,7 +337,9 @@ export function useNotebook() {
     }));
 
     try {
-      await restartPyodideKernel();
+      const kernel = kernelClientRef.current;
+      if (!kernel) throw new Error('Kernel not initialized');
+      await kernel.restart();
       setState((prev) => ({ ...prev, kernelStatus: 'idle', executionCounter: 0 }));
     } catch (error) {
       console.error('Failed to restart kernel:', error);
@@ -349,7 +348,9 @@ export function useNotebook() {
   }, []);
 
   const interruptKernel = useCallback(() => {
-    // Note: Pyodide doesn't support true interruption, but we can update UI state
+    kernelClientRef.current?.interrupt();
+
+    // Update UI state
     setState((prev) => ({
       ...prev,
       kernelStatus: 'idle',
@@ -373,7 +374,7 @@ export function useNotebook() {
     setState({
       cells: newNotebook.cells,
       activeCellId: null,
-      kernelStatus: isKernelLoaded() ? 'idle' : 'disconnected',
+      kernelStatus: kernelClientRef.current?.isLoaded() ? 'idle' : 'disconnected',
       variables: [],
       lastSaved: newNotebook.metadata.updatedAt,
       isDirty: false,
@@ -391,7 +392,7 @@ export function useNotebook() {
       setState({
         cells: notebook.cells,
         activeCellId: null,
-        kernelStatus: isKernelLoaded() ? 'idle' : 'disconnected',
+        kernelStatus: kernelClientRef.current?.isLoaded() ? 'idle' : 'disconnected',
         variables: [],
         lastSaved: notebook.metadata.updatedAt,
         isDirty: false,
