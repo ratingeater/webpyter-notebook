@@ -1,4 +1,4 @@
-import { useRef, useEffect } from 'react';
+import { useRef, useEffect, useCallback } from 'react';
 import Editor, { OnMount, loader } from '@monaco-editor/react';
 import type { editor } from 'monaco-editor';
 
@@ -51,10 +51,18 @@ export function CodeEditor({
     onFocusRef.current = onFocus;
   }, [onFocus]);
 
+  // Handle keyboard shortcuts - only execute if this editor has focus
+  const handleExecuteShortcut = useCallback((advance: boolean) => {
+    // Check if this editor instance has focus
+    if (editorRef.current?.hasWidgetFocus()) {
+      onExecuteRef.current(advance);
+    }
+  }, []);
+
   const handleEditorMount: OnMount = (editor, monaco) => {
     editorRef.current = editor;
 
-    // Define custom theme
+    // Define custom theme (only needs to be done once globally, but harmless to repeat)
     monaco.editor.defineTheme('jupyter-dark', {
       base: 'vs-dark',
       inherit: true,
@@ -84,13 +92,26 @@ export function CodeEditor({
 
     monaco.editor.setTheme('jupyter-dark');
 
-    // Add keyboard shortcuts - use ref to always get latest callback
-    editor.addCommand(monaco.KeyMod.Shift | monaco.KeyCode.Enter, () => {
-      onExecuteRef.current(true);
+    // Add keyboard shortcuts using keybinding with context
+    // Using addAction instead of addCommand for better control
+    editor.addAction({
+      id: 'execute-cell-advance',
+      label: 'Execute Cell and Advance',
+      keybindings: [monaco.KeyMod.Shift | monaco.KeyCode.Enter],
+      run: () => {
+        // This action is bound to THIS specific editor instance
+        onExecuteRef.current(true);
+      },
     });
 
-    editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.Enter, () => {
-      onExecuteRef.current(false);
+    editor.addAction({
+      id: 'execute-cell-stay',
+      label: 'Execute Cell',
+      keybindings: [monaco.KeyMod.CtrlCmd | monaco.KeyCode.Enter],
+      run: () => {
+        // This action is bound to THIS specific editor instance
+        onExecuteRef.current(false);
+      },
     });
     
     // Listen for focus events to activate the cell

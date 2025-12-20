@@ -1,5 +1,5 @@
 import { useState, useEffect } from 'react';
-import { X, Keyboard, Monitor, Code } from 'lucide-react';
+import { Keyboard, Monitor, Code, Server, RefreshCw } from 'lucide-react';
 import {
   Dialog,
   DialogContent,
@@ -10,12 +10,16 @@ import { Switch } from '@/components/ui/switch';
 import { Label } from '@/components/ui/label';
 import { Separator } from '@/components/ui/separator';
 
+export type KernelMode = 'backend' | 'pyodide';
+
 export interface NotebookSettings {
   fontSize: number;
   tabSize: number;
   wordWrap: boolean;
   lineNumbers: boolean;
   autoSaveInterval: number;
+  backendKernelUrl: string;
+  kernelMode: KernelMode; // Strict mode selection: 'backend' or 'pyodide'
 }
 
 const defaultSettings: NotebookSettings = {
@@ -24,6 +28,8 @@ const defaultSettings: NotebookSettings = {
   wordWrap: true,
   lineNumbers: true,
   autoSaveInterval: 30,
+  backendKernelUrl: '', // Will be auto-detected or set by user
+  kernelMode: 'backend', // Default to backend (supports pip install, etc.)
 };
 
 interface SettingsDialogProps {
@@ -31,6 +37,8 @@ interface SettingsDialogProps {
   onClose: () => void;
   settings: NotebookSettings;
   onSettingsChange: (settings: NotebookSettings) => void;
+  kernelKind?: 'backend' | 'pyodide' | null;
+  onReconnectKernel?: () => void;
 }
 
 export function SettingsDialog({
@@ -38,6 +46,8 @@ export function SettingsDialog({
   onClose,
   settings,
   onSettingsChange,
+  kernelKind,
+  onReconnectKernel,
 }: SettingsDialogProps) {
   const [localSettings, setLocalSettings] = useState<NotebookSettings>(settings);
 
@@ -56,14 +66,14 @@ export function SettingsDialog({
 
   return (
     <Dialog open={isOpen} onOpenChange={(open) => !open && onClose()}>
-      <DialogContent className="glassmorphism border-[var(--jupyter-border)] max-w-lg">
+      <DialogContent className="glassmorphism border-[var(--jupyter-border)] max-w-lg max-h-[85vh] overflow-y-auto">
         <DialogHeader>
           <DialogTitle className="font-heading text-lg text-foreground">
             Settings
           </DialogTitle>
         </DialogHeader>
 
-        <div className="space-y-6 py-4">
+        <div className="space-y-6 py-4 overflow-visible">
           {/* Keyboard Shortcuts Section */}
           <div>
             <div className="flex items-center gap-2 mb-3">
@@ -205,6 +215,124 @@ export function SettingsDialog({
                 <option value={120}>2 minutes</option>
                 <option value={0}>Disabled</option>
               </select>
+            </div>
+          </div>
+
+          <Separator className="bg-[var(--jupyter-border)]" />
+
+          {/* Python Kernel Settings */}
+          <div>
+            <div className="flex items-center gap-2 mb-3">
+              <Server className="w-4 h-4 text-[var(--jupyter-accent)]" />
+              <h3 className="font-ui text-sm font-medium text-foreground">
+                Python Kernel
+              </h3>
+            </div>
+            <div className="space-y-4">
+              {/* Kernel Mode Selection */}
+              <div className="space-y-2">
+                <Label className="font-ui text-sm text-muted-foreground">
+                  Kernel Mode
+                </Label>
+                <div className="grid grid-cols-2 gap-2">
+                  <button
+                    onClick={() => handleChange('kernelMode', 'backend')}
+                    className={`p-3 rounded-lg border text-left transition-all ${
+                      localSettings.kernelMode === 'backend'
+                        ? 'border-green-500 bg-green-500/10'
+                        : 'border-[var(--jupyter-border)] bg-secondary/30 hover:bg-secondary/50'
+                    }`}
+                  >
+                    <div className="flex items-center gap-2 mb-1">
+                      <div className={`w-2 h-2 rounded-full ${
+                        localSettings.kernelMode === 'backend' ? 'bg-green-500' : 'bg-muted-foreground/30'
+                      }`} />
+                      <span className="font-ui text-sm font-medium text-foreground">Backend</span>
+                    </div>
+                    <p className="font-ui text-xs text-muted-foreground">
+                      Full Python with pip install support
+                    </p>
+                  </button>
+                  <button
+                    onClick={() => handleChange('kernelMode', 'pyodide')}
+                    className={`p-3 rounded-lg border text-left transition-all ${
+                      localSettings.kernelMode === 'pyodide'
+                        ? 'border-yellow-500 bg-yellow-500/10'
+                        : 'border-[var(--jupyter-border)] bg-secondary/30 hover:bg-secondary/50'
+                    }`}
+                  >
+                    <div className="flex items-center gap-2 mb-1">
+                      <div className={`w-2 h-2 rounded-full ${
+                        localSettings.kernelMode === 'pyodide' ? 'bg-yellow-500' : 'bg-muted-foreground/30'
+                      }`} />
+                      <span className="font-ui text-sm font-medium text-foreground">Pyodide</span>
+                    </div>
+                    <p className="font-ui text-xs text-muted-foreground">
+                      Browser-based (limited packages)
+                    </p>
+                  </button>
+                </div>
+              </div>
+              
+              {/* Backend URL (only show when backend mode is selected) */}
+              {localSettings.kernelMode === 'backend' && (
+                <div className="space-y-2">
+                  <Label htmlFor="backendUrl" className="font-ui text-sm text-muted-foreground">
+                    Backend Kernel URL
+                  </Label>
+                  <input
+                    id="backendUrl"
+                    type="text"
+                    value={localSettings.backendKernelUrl}
+                    onChange={(e) => handleChange('backendKernelUrl', e.target.value)}
+                    placeholder="e.g., http://localhost:5000"
+                    className="w-full font-code text-sm bg-secondary border border-[var(--jupyter-border)] rounded px-3 py-2 text-foreground placeholder:text-muted-foreground/50"
+                  />
+                  <p className="font-ui text-xs text-muted-foreground">
+                    URL of your Python kernel server
+                  </p>
+                </div>
+              )}
+
+              {/* Current Status */}
+              <div className="bg-secondary/30 rounded-lg p-3 space-y-2">
+                <div className="flex items-center justify-between">
+                  <div>
+                    <span className="font-ui text-sm text-muted-foreground">Status: </span>
+                    <span className={`font-ui text-sm font-medium ${
+                      kernelKind === 'backend' ? 'text-green-400' : 
+                      kernelKind === 'pyodide' ? 'text-yellow-400' : 'text-red-400'
+                    }`}>
+                      {kernelKind === 'backend' ? 'Connected to Backend' : 
+                       kernelKind === 'pyodide' ? 'Using Pyodide (Browser)' : 'Disconnected'}
+                    </span>
+                  </div>
+                  {onReconnectKernel && (
+                    <button
+                      onClick={onReconnectKernel}
+                      className="flex items-center gap-1.5 px-2 py-1 bg-[var(--jupyter-accent)]/20 hover:bg-[var(--jupyter-accent)]/30 text-[var(--jupyter-accent)] rounded text-xs font-ui transition-colors"
+                    >
+                      <RefreshCw className="w-3 h-3" />
+                      Reconnect
+                    </button>
+                  )}
+                </div>
+                {kernelKind === 'backend' && (
+                  <p className="font-ui text-xs text-green-400/80">
+                    ✓ Full Python environment with pip install support
+                  </p>
+                )}
+                {kernelKind === 'pyodide' && (
+                  <p className="font-ui text-xs text-yellow-400/80">
+                    ⚠ Limited to pre-bundled packages (numpy, pandas, matplotlib)
+                  </p>
+                )}
+                {!kernelKind && (
+                  <p className="font-ui text-xs text-red-400/80">
+                    ✗ Click Reconnect to connect to kernel
+                  </p>
+                )}
+              </div>
             </div>
           </div>
         </div>

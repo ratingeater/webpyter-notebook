@@ -1,15 +1,10 @@
+import type { CellOutput, Variable } from '@/types/notebook';
+
 export type KernelStatus = 'disconnected' | 'loading' | 'idle' | 'busy' | 'starting';
 
-export type CellOutput =
-  | { type: 'text'; content: string }
-  | { type: 'plot'; content: string }
-  | { type: 'error'; content: string };
+export type KernelVariable = Variable;
 
-export type KernelVariable = {
-  name: string;
-  type: string;
-  value: string;
-};
+export type { CellOutput };
 
 export type KernelClient = {
   kind: 'pyodide' | 'backend';

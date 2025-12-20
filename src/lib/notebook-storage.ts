@@ -1,13 +1,32 @@
 import { Cell, NotebookMetadata, SavedNotebook, Variable } from '@/types/notebook';
+import {
+  isBackendStorageAvailable,
+  listBackendNotebooks,
+  getBackendNotebook,
+  saveBackendNotebook,
+  deleteBackendNotebook,
+} from './backend-storage';
 
 const STORAGE_KEY = 'jupyter-ish-notebooks';
 const CURRENT_NOTEBOOK_KEY = 'jupyter-ish-current-notebook';
+
+// Track storage mode
+let useBackendStorage = false;
+
+export function setUseBackendStorage(value: boolean) {
+  useBackendStorage = value;
+}
+
+export function getUseBackendStorage(): boolean {
+  return useBackendStorage && isBackendStorageAvailable();
+}
 
 export function generateNotebookId(): string {
   return `nb_${Date.now()}_${Math.random().toString(36).substring(2, 9)}`;
 }
 
 export function getAllNotebooks(): NotebookMetadata[] {
+  // Local storage only - use getAllNotebooksAsync for backend support
   try {
     const data = localStorage.getItem(STORAGE_KEY);
     if (!data) return [];
@@ -22,7 +41,19 @@ export function getAllNotebooks(): NotebookMetadata[] {
   }
 }
 
+export async function getAllNotebooksAsync(): Promise<NotebookMetadata[]> {
+  if (getUseBackendStorage()) {
+    try {
+      return await listBackendNotebooks();
+    } catch (e) {
+      console.warn('Failed to list notebooks from backend:', e);
+    }
+  }
+  return getAllNotebooks();
+}
+
 export function getNotebook(id: string): SavedNotebook | null {
+  // Local storage only - use getNotebookAsync for backend support
   try {
     const data = localStorage.getItem(STORAGE_KEY);
     if (!data) return null;
@@ -40,6 +71,17 @@ export function getNotebook(id: string): SavedNotebook | null {
   } catch {
     return null;
   }
+}
+
+export async function getNotebookAsync(id: string): Promise<SavedNotebook | null> {
+  if (getUseBackendStorage()) {
+    try {
+      return await getBackendNotebook(id);
+    } catch (e) {
+      console.warn('Failed to get notebook from backend:', e);
+    }
+  }
+  return getNotebook(id);
 }
 
 export function saveNotebook(
@@ -65,7 +107,7 @@ export function saveNotebook(
     },
     cells: cells.map((cell) => ({
       ...cell,
-      output: undefined, // Don't save outputs
+      output: undefined, // Don't save outputs to localStorage
       status: 'idle',
       executionCount: undefined,
     })),
@@ -78,6 +120,27 @@ export function saveNotebook(
   return notebook;
 }
 
+export async function saveNotebookAsync(
+  id: string,
+  title: string,
+  cells: Cell[],
+  variables: Variable[]
+): Promise<SavedNotebook> {
+  // Always save to localStorage as backup
+  const localNotebook = saveNotebook(id, title, cells, variables);
+  
+  // Also save to backend if available (with outputs for persistence)
+  if (getUseBackendStorage()) {
+    try {
+      await saveBackendNotebook(id, title, cells, variables);
+    } catch (e) {
+      console.warn('Failed to save notebook to backend:', e);
+    }
+  }
+  
+  return localNotebook;
+}
+
 export function deleteNotebook(id: string): void {
   const data = localStorage.getItem(STORAGE_KEY);
   if (!data) return;
@@ -85,6 +148,18 @@ export function deleteNotebook(id: string): void {
   const notebooks: Record<string, SavedNotebook> = JSON.parse(data);
   delete notebooks[id];
   localStorage.setItem(STORAGE_KEY, JSON.stringify(notebooks));
+}
+
+export async function deleteNotebookAsync(id: string): Promise<void> {
+  deleteNotebook(id);
+  
+  if (getUseBackendStorage()) {
+    try {
+      await deleteBackendNotebook(id);
+    } catch (e) {
+      console.warn('Failed to delete notebook from backend:', e);
+    }
+  }
 }
 
 export function renameNotebook(id: string, newTitle: string): void {
@@ -122,7 +197,7 @@ export function createNewNotebook(): SavedNotebook {
     {
       id: Math.random().toString(36).substring(2, 11),
       type: 'code',
-      content: '# Write your Python code here\nprint("Hello, World!")',
+      content: '# Write your Python code here\n# Press Shift+Enter to execute',
       status: 'idle',
     },
   ];

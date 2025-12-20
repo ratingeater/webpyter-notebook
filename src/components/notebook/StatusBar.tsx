@@ -21,18 +21,22 @@ import { cn } from '@/lib/utils';
 
 interface StatusBarProps {
   kernelStatus: KernelStatus;
+  kernelKind?: 'backend' | 'pyodide' | null;
   lastSaved: Date | null;
   isDirty: boolean;
   onRestartKernel: () => void;
   onInterruptKernel: () => void;
+  onReconnectKernel?: () => void;
 }
 
 export function StatusBar({
   kernelStatus,
+  kernelKind,
   lastSaved,
   isDirty,
   onRestartKernel,
   onInterruptKernel,
+  onReconnectKernel,
 }: StatusBarProps) {
   const [memoryUsage] = useState('128 MB');
 
@@ -71,12 +75,32 @@ export function StatusBar({
   const getStatusText = () => {
     switch (kernelStatus) {
       case 'loading':
-        return 'Loading Pyodide...';
+        return kernelKind === 'backend' ? 'Connecting...' : 'Loading Pyodide...';
       case 'busy':
-        return 'Running (CPU intensive)';
+        return 'Running';
+      case 'idle':
+        return kernelKind === 'backend' ? 'Backend Ready' : 'Pyodide Ready';
+      case 'disconnected':
+        return 'Disconnected';
       default:
         return kernelStatus;
     }
+  };
+
+  const getKernelBadge = () => {
+    if (!kernelKind) return null;
+    if (kernelKind === 'backend') {
+      return (
+        <span className="px-1.5 py-0.5 rounded text-[10px] font-medium bg-green-500/20 text-green-400 border border-green-500/30">
+          BACKEND
+        </span>
+      );
+    }
+    return (
+      <span className="px-1.5 py-0.5 rounded text-[10px] font-medium bg-yellow-500/20 text-yellow-400 border border-yellow-500/30">
+        PYODIDE
+      </span>
+    );
   };
 
   const formatLastSaved = () => {
@@ -108,7 +132,7 @@ export function StatusBar({
             side="top"
             className="glassmorphism border-[var(--jupyter-border)]"
           >
-            <DropdownMenuItem onClick={onRestartKernel}>
+            <DropdownMenuItem onClick={onRestartKernel} disabled={!kernelKind}>
               <RefreshCw className="w-4 h-4 mr-2" />
               Restart Kernel
             </DropdownMenuItem>
@@ -120,15 +144,23 @@ export function StatusBar({
               Interrupt Execution
             </DropdownMenuItem>
             <DropdownMenuSeparator />
-            <DropdownMenuItem disabled={kernelStatus !== 'disconnected'}>
+            <DropdownMenuItem 
+              onClick={onReconnectKernel}
+              disabled={kernelStatus === 'loading'}
+            >
               <Wifi className="w-4 h-4 mr-2" />
               Reconnect
             </DropdownMenuItem>
           </DropdownMenuContent>
         </DropdownMenu>
 
+        {/* Kernel type badge */}
+        {getKernelBadge()}
+
         {/* Python version */}
-        <span className="font-ui text-xs text-muted-foreground">Python 3.11</span>
+        <span className="font-ui text-xs text-muted-foreground">
+          {kernelKind === 'backend' ? 'Python 3.x' : 'Python 3.11 (WASM)'}
+        </span>
       </div>
 
       {/* Right section */}

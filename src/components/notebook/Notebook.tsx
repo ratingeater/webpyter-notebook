@@ -20,6 +20,7 @@ export function Notebook() {
     isDirty,
     notebookTitle,
     kernelLoadingMessage,
+    kernelKind,
     setActiveCell,
     updateCellContent,
     addCell,
@@ -30,6 +31,7 @@ export function Notebook() {
     executeCell,
     restartKernel,
     interruptKernel,
+    reconnectToKernel,
     createNotebook,
     loadNotebook,
     updateNotebookTitle,
@@ -98,11 +100,39 @@ export function Notebook() {
 
   return (
     <div className="h-screen w-screen flex flex-col overflow-hidden bg-[var(--jupyter-bg)]">
-      {/* Kernel loading indicator - non-blocking banner */}
-      {kernelStatus === 'loading' && (
-        <div className="absolute top-16 left-1/2 -translate-x-1/2 z-50 bg-[var(--jupyter-surface)] border border-[var(--jupyter-border)] rounded-lg px-4 py-2 shadow-lg flex items-center gap-3">
-          <div className="w-4 h-4 border-2 border-[var(--jupyter-accent)] border-t-transparent rounded-full animate-spin" />
-          <span className="font-ui text-sm text-foreground">{kernelLoadingMessage || 'Loading Python kernel...'}</span>
+      {/* Kernel loading/error indicator - non-blocking banner */}
+      {(kernelStatus === 'loading' || (kernelStatus === 'disconnected' && kernelLoadingMessage)) && (
+        <div className={`absolute top-16 left-1/2 -translate-x-1/2 z-50 border rounded-lg px-4 py-3 shadow-lg max-w-md ${
+          kernelStatus === 'disconnected' 
+            ? 'bg-red-500/10 border-red-500/30' 
+            : 'bg-[var(--jupyter-surface)] border-[var(--jupyter-border)]'
+        }`}>
+          <div className="flex items-center gap-3">
+            {kernelStatus === 'loading' ? (
+              <div className="w-4 h-4 border-2 border-[var(--jupyter-accent)] border-t-transparent rounded-full animate-spin" />
+            ) : (
+              <div className="w-4 h-4 text-red-400">✕</div>
+            )}
+            <span className={`font-ui text-sm ${kernelStatus === 'disconnected' ? 'text-red-400' : 'text-foreground'}`}>
+              {kernelLoadingMessage || 'Loading Python kernel...'}
+            </span>
+          </div>
+          {kernelStatus === 'disconnected' && (
+            <div className="flex items-center gap-2 mt-3 pt-3 border-t border-red-500/20">
+              <button
+                onClick={() => setIsSettingsOpen(true)}
+                className="flex-1 px-3 py-1.5 bg-[var(--jupyter-accent)] hover:bg-[var(--jupyter-accent)]/80 text-white rounded text-xs font-ui transition-colors"
+              >
+                Open Settings
+              </button>
+              <button
+                onClick={reconnectToKernel}
+                className="px-3 py-1.5 bg-secondary hover:bg-secondary/80 text-foreground rounded text-xs font-ui transition-colors"
+              >
+                Retry
+              </button>
+            </div>
+          )}
         </div>
       )}
 
@@ -193,10 +223,12 @@ export function Notebook() {
       {/* Status Bar */}
       <StatusBar
         kernelStatus={kernelStatus}
+        kernelKind={kernelKind}
         lastSaved={lastSaved}
         isDirty={isDirty}
         onRestartKernel={restartKernel}
         onInterruptKernel={interruptKernel}
+        onReconnectKernel={reconnectToKernel}
       />
 
       {/* Plot Viewer Modal */}
@@ -215,6 +247,8 @@ export function Notebook() {
         onClose={() => setIsSettingsOpen(false)}
         settings={settings}
         onSettingsChange={handleSettingsChange}
+        kernelKind={kernelKind}
+        onReconnectKernel={reconnectToKernel}
       />
     </div>
   );

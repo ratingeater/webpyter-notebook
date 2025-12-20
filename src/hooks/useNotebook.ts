@@ -1,14 +1,15 @@
 import { useState, useCallback, useEffect, useRef } from 'react';
 import { Cell, CellType, NotebookState } from '@/types/notebook';
 import type { KernelClient } from '@/lib/kernel-client';
-import { selectKernelClient } from '@/lib/kernel-manager';
+import { selectKernelClient, reconnectKernel } from '@/lib/kernel-manager';
 import {
   getNotebook,
   saveNotebook,
+  saveNotebookAsync,
   createNewNotebook,
   getCurrentNotebookId,
   setCurrentNotebookId,
-  generateNotebookId,
+  setUseBackendStorage,
 } from '@/lib/notebook-storage';
 
 const generateId = () => Math.random().toString(36).substring(2, 11);
@@ -59,14 +60,18 @@ export function useNotebook() {
   const [state, setState] = useState<NotebookState>(getInitialState);
   const autoSaveRef = useRef<NodeJS.Timeout | null>(null);
   const [kernelLoadingMessage, setKernelLoadingMessage] = useState<string>('');
+  const [kernelKind, setKernelKind] = useState<'backend' | 'pyodide' | null>(null);
   const kernelClientRef = useRef<KernelClient | null>(null);
-  const kernelKindRef = useRef<'backend' | 'pyodide' | null>(null);
 
   // Keep a ref to current state for callbacks to avoid stale closures
   const stateRef = useRef(state);
   stateRef.current = state;
+  
+  // Keep a ref for kernel kind as well (for use in callbacks)
+  const kernelKindRef = useRef(kernelKind);
+  kernelKindRef.current = kernelKind;
 
-  // Initialize kernel on mount (prefer backend; fallback to Pyodide)
+  // Initialize kernel on mount
   useEffect(() => {
     const initKernel = async () => {
       // Delay kernel loading to let UI render first (use requestIdleCallback if available)
@@ -76,14 +81,21 @@ export function useNotebook() {
         selectKernelClient((message) => setKernelLoadingMessage(message))
           .then((client) => {
             kernelClientRef.current = client;
-            kernelKindRef.current = client.kind;
+            setKernelKind(client.kind);
+            // Enable backend storage when connected to backend
+            setUseBackendStorage(client.kind === 'backend');
             setState((prev) => ({ ...prev, kernelStatus: 'idle' }));
             setKernelLoadingMessage('');
           })
           .catch((error) => {
             console.error('Failed to initialize kernel:', error);
+            kernelClientRef.current = null;
+            setKernelKind(null);
+            setUseBackendStorage(false);
             setState((prev) => ({ ...prev, kernelStatus: 'disconnected' }));
-            setKernelLoadingMessage('Failed to load Python kernel');
+            // Show error message to user
+            const errorMsg = error instanceof Error ? error.message : 'Failed to connect to kernel';
+            setKernelLoadingMessage(errorMsg);
           });
       };
 
@@ -101,17 +113,19 @@ export function useNotebook() {
   useEffect(() => {
     autoSaveRef.current = setInterval(() => {
       if (state.isDirty) {
-        saveNotebook(
+        // Use async save to support backend storage
+        saveNotebookAsync(
           state.notebookId,
           state.notebookTitle,
           state.cells,
           state.variables
-        );
-        setState((prev) => ({
-          ...prev,
-          lastSaved: new Date(),
-          isDirty: false,
-        }));
+        ).then(() => {
+          setState((prev) => ({
+            ...prev,
+            lastSaved: new Date(),
+            isDirty: false,
+          }));
+        });
       }
     }, 30000);
 
@@ -360,6 +374,46 @@ export function useNotebook() {
     }));
   }, []);
 
+  // Reconnect to kernel (used when settings change)
+  const reconnectToKernel = useCallback(async () => {
+    // Immediately update UI to show we're reconnecting
+    kernelClientRef.current = null;
+    setKernelKind(null);
+    setState((prev) => ({ ...prev, kernelStatus: 'loading' }));
+    setKernelLoadingMessage('Reconnecting to kernel...');
+
+    try {
+      const client = await reconnectKernel((message) => setKernelLoadingMessage(message));
+      kernelClientRef.current = client;
+      setKernelKind(client.kind);
+      
+      // Enable backend storage when connected to backend
+      setUseBackendStorage(client.kind === 'backend');
+      
+      // Update state
+      setState((prev) => ({ 
+        ...prev, 
+        kernelStatus: 'idle',
+        variables: [], // Clear variables on reconnect
+      }));
+      setKernelLoadingMessage('');
+      
+      return client.kind;
+    } catch (error) {
+      console.error('Failed to reconnect kernel:', error);
+      kernelClientRef.current = null;
+      setKernelKind(null);
+      setUseBackendStorage(false);
+      setState((prev) => ({ ...prev, kernelStatus: 'disconnected' }));
+      const errorMsg = error instanceof Error ? error.message : 'Failed to reconnect to kernel';
+      setKernelLoadingMessage(errorMsg);
+      return null;
+    }
+  }, []);
+
+  // Get current kernel kind (for external use, returns from ref for immediate access)
+  const getKernelKind = useCallback(() => kernelKind, [kernelKind]);
+
   const reorderCells = useCallback((startIndex: number, endIndex: number) => {
     setState((prev) => {
       const newCells = [...prev.cells];
@@ -411,8 +465,8 @@ export function useNotebook() {
     }));
   }, []);
 
-  const saveCurrentNotebook = useCallback(() => {
-    saveNotebook(
+  const saveCurrentNotebook = useCallback(async () => {
+    await saveNotebookAsync(
       state.notebookId,
       state.notebookTitle,
       state.cells,
@@ -428,6 +482,7 @@ export function useNotebook() {
   return {
     ...state,
     kernelLoadingMessage,
+    kernelKind,
     setActiveCell,
     updateCellContent,
     addCell,
@@ -438,6 +493,8 @@ export function useNotebook() {
     executeCell,
     restartKernel,
     interruptKernel,
+    reconnectToKernel,
+    getKernelKind,
     reorderCells,
     createNotebook,
     loadNotebook,
