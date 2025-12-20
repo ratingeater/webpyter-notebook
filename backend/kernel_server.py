@@ -489,27 +489,45 @@ def execute_python_code(code: str) -> Dict[str, Any]:
     
     try:
         with redirect_stdout(stdout_capture), redirect_stderr(stderr_capture):
-            # Compile and execute as exec mode
-            # This properly handles if __name__ == "__main__", classes, functions, etc.
-            compiled = compile(code, '<cell>', 'exec')
-            exec(compiled, kernel.globals)
-            
-            # For single-expression code, try to get result value
-            # But only if the code is a single line simple expression
+            # Get last expression for potential result display
             lines = [l for l in code.strip().split('\n') if l.strip() and not l.strip().startswith('#')]
-            if len(lines) == 1:
-                last_line = lines[0].strip()
-                # Check if it's a simple expression (not assignment, statement, etc.)
-                if not any([
-                    '=' in last_line and '==' not in last_line and '!=' not in last_line and '<=' not in last_line and '>=' not in last_line,
-                    last_line.startswith(('if ', 'for ', 'while ', 'def ', 'class ', 'with ', 'try:', 'except', 'return ', 'import ', 'from ', 'raise ', 'assert ', 'del ', 'pass', 'break', 'continue', 'global ', 'nonlocal ')),
-                    last_line.endswith(':'),
-                ]):
-                    try:
-                        compiled_expr = compile(last_line, '<cell>', 'eval')
-                        result = eval(compiled_expr, kernel.globals)
-                    except:
-                        pass
+            
+            # Try to separate last line if it's a pure expression
+            last_line = lines[-1].strip() if lines else ''
+            
+            # Check if last line is a simple expression (for result display like Jupyter)
+            # Exclude: assignments, statements, function calls with no return, etc.
+            is_simple_expr = False
+            if last_line and not any([
+                # Assignment (but not comparison)
+                '=' in last_line and not any(op in last_line for op in ['==', '!=', '<=', '>=', '+=', '-=', '*=', '/=']),
+                # Statement keywords
+                last_line.startswith(('if ', 'for ', 'while ', 'def ', 'class ', 'with ', 'try:', 'except', 'return ', 'import ', 'from ', 'raise ', 'assert ', 'del ', 'pass', 'break', 'continue', 'global ', 'nonlocal ', 'print(', 'print ')),
+                # Block start
+                last_line.endswith(':'),
+            ]):
+                # Try to compile as expression to verify
+                try:
+                    compile(last_line, '<cell>', 'eval')
+                    is_simple_expr = True
+                except SyntaxError:
+                    is_simple_expr = False
+            
+            if is_simple_expr and len(lines) > 1:
+                # Execute all but last line as exec
+                code_without_last = '\n'.join(code.strip().split('\n')[:-1])
+                if code_without_last.strip():
+                    compiled = compile(code_without_last, '<cell>', 'exec')
+                    exec(compiled, kernel.globals)
+                # Evaluate last line for result
+                result = eval(compile(last_line, '<cell>', 'eval'), kernel.globals)
+            elif is_simple_expr and len(lines) == 1:
+                # Single expression - just eval it
+                result = eval(compile(last_line, '<cell>', 'eval'), kernel.globals)
+            else:
+                # Execute everything as exec (includes print statements, etc.)
+                compiled = compile(code, '<cell>', 'exec')
+                exec(compiled, kernel.globals)
         
         plot_data = get_plot_as_base64()
         kernel.execution_count += 1
@@ -532,7 +550,8 @@ def execute_python_code(code: str) -> Dict[str, Any]:
         output_parts.append(stdout_output.rstrip())
     if stderr_output:
         output_parts.append(stderr_output.rstrip())
-    if result is not None and repr(result) != 'None':
+    # Only show result if there's no stdout and result is meaningful
+    if result is not None and repr(result) != 'None' and not stdout_output:
         output_parts.append(repr(result))
     
     return {'output': {'type': 'text', 'content': '\n'.join(output_parts)}}
