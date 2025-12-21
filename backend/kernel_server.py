@@ -479,7 +479,13 @@ def parse_magic(code: str) -> Tuple[Optional[str], Optional[str], Optional[str],
 
 
 def execute_python_code(code: str) -> Dict[str, Any]:
-    """Execute pure Python code (no magic handling)"""
+    """Execute pure Python code (no magic handling)
+    
+    Strategy: 
+    1. First try to execute the entire code as exec (handles all Python constructs)
+    2. Then check if the last statement is a simple expression for display
+    3. This avoids breaking multi-line constructs like if/for/while blocks
+    """
     stdout_capture = io.StringIO()
     stderr_capture = io.StringIO()
     
@@ -489,45 +495,45 @@ def execute_python_code(code: str) -> Dict[str, Any]:
     
     try:
         with redirect_stdout(stdout_capture), redirect_stderr(stderr_capture):
-            # Get last expression for potential result display
-            lines = [l for l in code.strip().split('\n') if l.strip() and not l.strip().startswith('#')]
+            # Always execute the full code first
+            compiled = compile(code, '<cell>', 'exec')
+            exec(compiled, kernel.globals)
             
-            # Try to separate last line if it's a pure expression
-            last_line = lines[-1].strip() if lines else ''
+            # Now check if we should display the last expression's value
+            # Only for simple single-line expressions at the end
+            code_lines = code.strip().split('\n')
+            last_line = code_lines[-1].strip() if code_lines else ''
             
-            # Check if last line is a simple expression (for result display like Jupyter)
-            # Exclude: assignments, statements, function calls with no return, etc.
-            is_simple_expr = False
-            if last_line and not any([
-                # Assignment (but not comparison)
-                '=' in last_line and not any(op in last_line for op in ['==', '!=', '<=', '>=', '+=', '-=', '*=', '/=']),
-                # Statement keywords
-                last_line.startswith(('if ', 'for ', 'while ', 'def ', 'class ', 'with ', 'try:', 'except', 'return ', 'import ', 'from ', 'raise ', 'assert ', 'del ', 'pass', 'break', 'continue', 'global ', 'nonlocal ', 'print(', 'print ')),
-                # Block start
-                last_line.endswith(':'),
-            ]):
-                # Try to compile as expression to verify
+            # Only try to get result if:
+            # 1. Last line is not empty and not a comment
+            # 2. Last line is not indented (not part of a block)
+            # 3. Last line doesn't start with a statement keyword
+            # 4. Last line doesn't contain assignment
+            # 5. It can compile as a standalone expression
+            should_eval_last = False
+            
+            if (last_line and 
+                not last_line.startswith('#') and
+                not code_lines[-1].startswith((' ', '\t')) and  # Not indented
+                not last_line.endswith(':') and  # Not a block start
+                not last_line.startswith(('if ', 'for ', 'while ', 'def ', 'class ', 'with ', 
+                                         'try:', 'except', 'finally:', 'elif ', 'else:',
+                                         'return ', 'yield ', 'import ', 'from ', 'raise ', 
+                                         'assert ', 'del ', 'pass', 'break', 'continue', 
+                                         'global ', 'nonlocal ', 'print(', 'print ')) and
+                not ('=' in last_line and '==' not in last_line and '!=' not in last_line and 
+                     '<=' not in last_line and '>=' not in last_line)):
                 try:
                     compile(last_line, '<cell>', 'eval')
-                    is_simple_expr = True
+                    should_eval_last = True
                 except SyntaxError:
-                    is_simple_expr = False
+                    pass
             
-            if is_simple_expr and len(lines) > 1:
-                # Execute all but last line as exec
-                code_without_last = '\n'.join(code.strip().split('\n')[:-1])
-                if code_without_last.strip():
-                    compiled = compile(code_without_last, '<cell>', 'exec')
-                    exec(compiled, kernel.globals)
-                # Evaluate last line for result
-                result = eval(compile(last_line, '<cell>', 'eval'), kernel.globals)
-            elif is_simple_expr and len(lines) == 1:
-                # Single expression - just eval it
-                result = eval(compile(last_line, '<cell>', 'eval'), kernel.globals)
-            else:
-                # Execute everything as exec (includes print statements, etc.)
-                compiled = compile(code, '<cell>', 'exec')
-                exec(compiled, kernel.globals)
+            if should_eval_last:
+                try:
+                    result = eval(compile(last_line, '<cell>', 'eval'), kernel.globals)
+                except:
+                    pass  # Silently ignore if eval fails (result already from exec)
         
         plot_data = get_plot_as_base64()
         kernel.execution_count += 1

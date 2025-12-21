@@ -147,12 +147,15 @@ export function NotebookCell({
 
       {/* Cell output */}
       {cell.output && (
-        <CellOutput
-          output={cell.output}
-          isCollapsed={cell.isCollapsed ?? false}
-          onToggleCollapse={onToggleCollapse}
-          onExpandPlot={onExpandPlot}
-        />
+        <div className="ml-16 mr-4 mb-2">
+          <CellOutput
+            output={cell.output}
+            isCollapsed={cell.isCollapsed ?? false}
+            onToggleCollapse={onToggleCollapse}
+            onExpandPlot={onExpandPlot}
+            executionCount={cell.executionCount}
+          />
+        </div>
       )}
     </div>
   );
