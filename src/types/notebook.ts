@@ -2,6 +2,16 @@ export type CellType = 'code' | 'markdown';
 
 export type CellStatus = 'idle' | 'running' | 'success' | 'error';
 
+export interface OutputItem {
+  type: 'text' | 'plot' | 'table' | 'latex' | 'error' | 'html';
+  content: string;
+  data?: {
+    'image/png'?: string;
+    'text/html'?: string;
+    'text/plain'?: string;
+  };
+}
+
 export interface CellOutput {
   type: 'text' | 'plot' | 'table' | 'latex' | 'error' | 'html';
   content: string;
@@ -11,6 +21,8 @@ export interface CellOutput {
     'text/html'?: string;
     'text/plain'?: string;
   };
+  // Support multiple outputs like Jupyter
+  outputs?: OutputItem[];
 }
 
 export interface Cell {

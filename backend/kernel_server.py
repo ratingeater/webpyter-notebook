@@ -117,20 +117,30 @@ except ImportError:
     pass
 
 
-def get_plot_as_base64() -> Optional[str]:
-    """Capture current matplotlib figure as base64 PNG"""
+def get_all_plots_as_base64() -> List[str]:
+    """Capture all matplotlib figures as base64 PNGs"""
     if not matplotlib_available or plt is None:
-        return None
+        return []
     
-    if plt.get_fignums():
+    plots = []
+    fig_nums = plt.get_fignums()
+    for fig_num in fig_nums:
+        fig = plt.figure(fig_num)
         buf = io.BytesIO()
-        plt.savefig(buf, format='png', dpi=100, bbox_inches='tight',
+        fig.savefig(buf, format='png', dpi=100, bbox_inches='tight',
                     facecolor='white', edgecolor='none')
         buf.seek(0)
         img_base64 = base64.b64encode(buf.read()).decode('utf-8')
-        plt.close('all')
-        return img_base64
-    return None
+        plots.append(img_base64)
+    
+    plt.close('all')
+    return plots
+
+
+def get_plot_as_base64() -> Optional[str]:
+    """Capture current matplotlib figure as base64 PNG (legacy, single plot)"""
+    plots = get_all_plots_as_base64()
+    return plots[0] if plots else None
 
 
 # ============== Magic Commands ==============
@@ -485,13 +495,13 @@ def execute_python_code(code: str) -> Dict[str, Any]:
     1. First try to execute the entire code as exec (handles all Python constructs)
     2. Then check if the last statement is a simple expression for display
     3. This avoids breaking multi-line constructs like if/for/while blocks
+    4. Support multiple outputs (text + plots) like Jupyter
     """
     stdout_capture = io.StringIO()
     stderr_capture = io.StringIO()
     
     result = None
     error_output = None
-    plot_data = None
     
     try:
         with redirect_stdout(stdout_capture), redirect_stderr(stderr_capture):
@@ -535,7 +545,8 @@ def execute_python_code(code: str) -> Dict[str, Any]:
                 except:
                     pass  # Silently ignore if eval fails (result already from exec)
         
-        plot_data = get_plot_as_base64()
+        # Collect all plots
+        plot_images = get_all_plots_as_base64()
         kernel.execution_count += 1
         
     except Exception as e:
@@ -547,20 +558,68 @@ def execute_python_code(code: str) -> Dict[str, Any]:
     if error_output:
         return {'output': {'type': 'error', 'content': error_output}}
     
-    if plot_data:
-        return {'output': {'type': 'plot', 'content': stdout_output, 
-                          'data': {'image/png': plot_data}}}
+    # Build multiple outputs like Jupyter
+    outputs = []
     
-    output_parts = []
+    # Add stdout first (text before plots)
     if stdout_output:
-        output_parts.append(stdout_output.rstrip())
-    if stderr_output:
-        output_parts.append(stderr_output.rstrip())
-    # Only show result if there's no stdout and result is meaningful
-    if result is not None and repr(result) != 'None' and not stdout_output:
-        output_parts.append(repr(result))
+        outputs.append({
+            'type': 'text',
+            'content': stdout_output.rstrip()
+        })
     
-    return {'output': {'type': 'text', 'content': '\n'.join(output_parts)}}
+    # Add stderr
+    if stderr_output:
+        outputs.append({
+            'type': 'text',
+            'content': stderr_output.rstrip()
+        })
+    
+    # Add all plots
+    for plot_img in plot_images:
+        outputs.append({
+            'type': 'plot',
+            'content': '',
+            'data': {'image/png': plot_img}
+        })
+    
+    # Add expression result if any (and no stdout)
+    if result is not None and repr(result) != 'None' and not stdout_output:
+        outputs.append({
+            'type': 'text',
+            'content': repr(result)
+        })
+    
+    # For backward compatibility, also set top-level fields
+    # Use the first output's type, or combine content
+    if not outputs:
+        return {'output': {'type': 'text', 'content': '', 'outputs': []}}
+    
+    # Determine primary type and content for legacy clients
+    primary_type = 'text'
+    primary_content = ''
+    primary_data = None
+    
+    text_parts = []
+    for out in outputs:
+        if out['type'] == 'text' and out.get('content'):
+            text_parts.append(out['content'])
+        elif out['type'] == 'plot':
+            primary_type = 'plot'
+            primary_data = out.get('data')
+    
+    primary_content = '\n'.join(text_parts)
+    
+    result_output = {
+        'type': primary_type,
+        'content': primary_content,
+        'outputs': outputs  # New field for multiple outputs
+    }
+    
+    if primary_data:
+        result_output['data'] = primary_data
+    
+    return {'output': result_output}
 
 
 def execute_code(code: str) -> Dict[str, Any]:

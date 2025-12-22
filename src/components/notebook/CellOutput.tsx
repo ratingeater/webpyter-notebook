@@ -1,5 +1,5 @@
 import { ChevronDown, ChevronRight, Maximize2, Copy, Check } from 'lucide-react';
-import { CellOutput as CellOutputType } from '@/types/notebook';
+import { CellOutput as CellOutputType, OutputItem } from '@/types/notebook';
 import { cn } from '@/lib/utils';
 import { useState } from 'react';
 
@@ -7,7 +7,7 @@ interface CellOutputProps {
   output: CellOutputType;
   isCollapsed: boolean;
   onToggleCollapse: () => void;
-  onExpandPlot?: () => void;
+  onExpandPlot?: (plotData?: string) => void;
   executionCount?: number;
 }
 
@@ -24,7 +24,8 @@ export function CellOutput({
   const hasContent = output.content?.trim() || 
                      output.type === 'plot' || 
                      output.type === 'error' ||
-                     (output.data && Object.keys(output.data).length > 0);
+                     (output.data && Object.keys(output.data).length > 0) ||
+                     (output.outputs && output.outputs.length > 0);
   
   // Don't render anything if there's no content
   if (!hasContent) {
@@ -39,7 +40,77 @@ export function CellOutput({
     }
   };
 
+  // Render a single output item
+  const renderSingleOutput = (item: OutputItem, index: number) => {
+    switch (item.type) {
+      case 'text':
+        if (!item.content?.trim()) return null;
+        return (
+          <pre key={index} className="font-code text-sm text-foreground/90 whitespace-pre-wrap break-words select-text">
+            {item.content}
+          </pre>
+        );
+
+      case 'error':
+        return (
+          <div key={index} className="bg-[var(--jupyter-error)]/10 border border-[var(--jupyter-error)]/30 rounded-lg p-4">
+            <pre className="font-code text-sm text-[var(--jupyter-error)] whitespace-pre-wrap break-words select-text">
+              {item.content}
+            </pre>
+          </div>
+        );
+
+      case 'plot':
+        if (item.data?.['image/png']) {
+          return (
+            <div key={index} className="relative group my-2">
+              <div className="bg-white rounded-lg p-4 inline-block">
+                <img
+                  src={`data:image/png;base64,${item.data['image/png']}`}
+                  alt={`Plot output ${index + 1}`}
+                  className="max-w-full h-auto transition-opacity duration-300"
+                />
+              </div>
+              
+              {/* Expand button */}
+              <button
+                onClick={() => onExpandPlot?.(item.data?.['image/png'])}
+                className="absolute top-2 right-2 p-2 bg-black/50 rounded-lg opacity-0 group-hover:opacity-100 transition-opacity hover:bg-black/70"
+              >
+                <Maximize2 className="w-4 h-4 text-white" />
+              </button>
+            </div>
+          );
+        }
+        return null;
+
+      case 'html':
+        return (
+          <div
+            key={index}
+            className="font-prose select-text"
+            dangerouslySetInnerHTML={{ __html: item.content }}
+          />
+        );
+
+      default:
+        if (!item.content?.trim()) return null;
+        return <pre key={index} className="font-code text-sm select-text">{item.content}</pre>;
+    }
+  };
+
+  // Render output - supports both single output (legacy) and multiple outputs
   const renderOutput = () => {
+    // If we have multiple outputs array, render them all
+    if (output.outputs && output.outputs.length > 0) {
+      return (
+        <div className="space-y-2">
+          {output.outputs.map((item, index) => renderSingleOutput(item, index))}
+        </div>
+      );
+    }
+    
+    // Legacy single output rendering
     switch (output.type) {
       case 'text':
         return (
@@ -58,7 +129,6 @@ export function CellOutput({
         );
 
       case 'plot':
-        // Check if we have actual image data
         if (output.data?.['image/png']) {
           return (
             <div className="relative group">
@@ -70,9 +140,8 @@ export function CellOutput({
                 />
               </div>
               
-              {/* Expand button */}
               <button
-                onClick={onExpandPlot}
+                onClick={() => onExpandPlot?.(output.data?.['image/png'])}
                 className="absolute top-2 right-2 p-2 bg-black/50 rounded-lg opacity-0 group-hover:opacity-100 transition-opacity hover:bg-black/70"
               >
                 <Maximize2 className="w-4 h-4 text-white" />
@@ -80,15 +149,7 @@ export function CellOutput({
             </div>
           );
         }
-        
-        // Fallback for legacy plot type without data
-        return (
-          <div className="relative group">
-            <div className="bg-white rounded-lg p-4 inline-block">
-              <div className="text-gray-500 text-sm">Plot rendering...</div>
-            </div>
-          </div>
-        );
+        return null;
 
       case 'table':
         return (
@@ -125,6 +186,10 @@ export function CellOutput({
     }
   };
 
+  // Count plots for header display
+  const plotCount = output.outputs?.filter(o => o.type === 'plot').length || (output.type === 'plot' ? 1 : 0);
+  const hasPlots = plotCount > 0;
+
   return (
     <div className="mt-2 border border-[var(--jupyter-border)] rounded-lg bg-[var(--jupyter-surface)]/30 overflow-hidden">
       {/* Output header */}
@@ -143,6 +208,11 @@ export function CellOutput({
           <span className="font-code text-xs text-muted-foreground">
             {output.type === 'error' ? 'Error' : `Out [${executionCount || ''}]`}
           </span>
+          {hasPlots && plotCount > 1 && (
+            <span className="font-code text-xs text-muted-foreground/60">
+              ({plotCount} plots)
+            </span>
+          )}
           {output.executionTime && (
             <span className="font-code text-xs text-muted-foreground/60">
               {(output.executionTime / 1000).toFixed(2)}s
@@ -151,7 +221,7 @@ export function CellOutput({
         </div>
         
         {/* Copy button for text output */}
-        {output.content && output.type !== 'plot' && (
+        {output.content && !hasPlots && (
           <button
             onClick={handleCopy}
             className="p-1 hover:bg-secondary/50 rounded transition-colors"
