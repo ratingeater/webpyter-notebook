@@ -493,9 +493,13 @@ def execute_python_code(code: str) -> Dict[str, Any]:
     
     Strategy: 
     1. First try to execute the entire code as exec (handles all Python constructs)
-    2. Then check if the last statement is a simple expression for display
+    2. Capture the result of the last expression WITHOUT re-executing it
     3. This avoids breaking multi-line constructs like if/for/while blocks
     4. Support multiple outputs (text + plots) like Jupyter
+    
+    IMPORTANT: We must NOT re-eval the last line after exec, because:
+    - Function calls would execute twice (double printing, double side effects)
+    - Only safe to eval pure expressions like variable names, literals, or math
     """
     stdout_capture = io.StringIO()
     stderr_capture = io.StringIO()
@@ -505,45 +509,46 @@ def execute_python_code(code: str) -> Dict[str, Any]:
     
     try:
         with redirect_stdout(stdout_capture), redirect_stderr(stderr_capture):
-            # Always execute the full code first
-            compiled = compile(code, '<cell>', 'exec')
-            exec(compiled, kernel.globals)
-            
-            # Now check if we should display the last expression's value
-            # Only for simple single-line expressions at the end
             code_lines = code.strip().split('\n')
             last_line = code_lines[-1].strip() if code_lines else ''
             
-            # Only try to get result if:
-            # 1. Last line is not empty and not a comment
-            # 2. Last line is not indented (not part of a block)
-            # 3. Last line doesn't start with a statement keyword
-            # 4. Last line doesn't contain assignment
-            # 5. It can compile as a standalone expression
-            should_eval_last = False
+            # Check if last line is a SAFE expression to eval for result display
+            # Safe means: no function calls, no side effects - just variable lookup or literals
+            is_safe_expr = False
             
             if (last_line and 
                 not last_line.startswith('#') and
                 not code_lines[-1].startswith((' ', '\t')) and  # Not indented
                 not last_line.endswith(':') and  # Not a block start
+                '(' not in last_line and  # No function calls!
+                '[' not in last_line and  # No list indexing (could call __getitem__)
                 not last_line.startswith(('if ', 'for ', 'while ', 'def ', 'class ', 'with ', 
                                          'try:', 'except', 'finally:', 'elif ', 'else:',
                                          'return ', 'yield ', 'import ', 'from ', 'raise ', 
                                          'assert ', 'del ', 'pass', 'break', 'continue', 
-                                         'global ', 'nonlocal ', 'print(', 'print ')) and
+                                         'global ', 'nonlocal ')) and
                 not ('=' in last_line and '==' not in last_line and '!=' not in last_line and 
                      '<=' not in last_line and '>=' not in last_line)):
+                # Try to compile as expression
                 try:
                     compile(last_line, '<cell>', 'eval')
-                    should_eval_last = True
+                    is_safe_expr = True
                 except SyntaxError:
                     pass
             
-            if should_eval_last:
-                try:
-                    result = eval(compile(last_line, '<cell>', 'eval'), kernel.globals)
-                except:
-                    pass  # Silently ignore if eval fails (result already from exec)
+            if is_safe_expr:
+                # Execute all but the last line
+                if len(code_lines) > 1:
+                    code_without_last = '\n'.join(code_lines[:-1])
+                    compiled = compile(code_without_last, '<cell>', 'exec')
+                    exec(compiled, kernel.globals)
+                
+                # Eval the last line for result (safe, no side effects)
+                result = eval(compile(last_line, '<cell>', 'eval'), kernel.globals)
+            else:
+                # Execute everything as exec
+                compiled = compile(code, '<cell>', 'exec')
+                exec(compiled, kernel.globals)
         
         # Collect all plots
         plot_images = get_all_plots_as_base64()
