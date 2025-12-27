@@ -1,4 +1,5 @@
 import { useState, useRef, useEffect } from 'react';
+import { useNavigate } from "react-router-dom";
 import { useNotebook } from '@/hooks/useNotebook';
 import { Header } from './Header';
 import { Sidebar } from './Sidebar';
@@ -9,8 +10,11 @@ import { AddCellButton } from './AddCellButton';
 import { PlotViewer } from './PlotViewer';
 import { SettingsDialog, type NotebookSettings, defaultSettings } from './SettingsDialog';
 import { CellType, CellOutput } from '@/types/notebook';
+import { generateNotebookId } from "@/lib/notebook-storage";
+import { notifyCollabConfigChanged } from "@/lib/collab";
 
-export function Notebook() {
+export function Notebook({ notebookId }: { notebookId: string }) {
+  const navigate = useNavigate();
   const {
     cells,
     activeCellId,
@@ -32,11 +36,13 @@ export function Notebook() {
     restartKernel,
     interruptKernel,
     reconnectToKernel,
-    createNotebook,
-    loadNotebook,
     updateNotebookTitle,
     saveCurrentNotebook,
-  } = useNotebook();
+    collabAwareness,
+    collabStatus,
+    collabPeerCount,
+    getCellYText,
+  } = useNotebook(notebookId);
 
   const [isSidebarVisible, setIsSidebarVisible] = useState(true);
   const [isVariablesVisible, setIsVariablesVisible] = useState(false);
@@ -44,15 +50,28 @@ export function Notebook() {
   const [isSettingsOpen, setIsSettingsOpen] = useState(false);
   const [currentPlotData, setCurrentPlotData] = useState<CellOutput | null>(null);
   const [settings, setSettings] = useState<NotebookSettings>(() => {
-    const saved = localStorage.getItem('jupyter-ish-settings');
-    return saved ? JSON.parse(saved) : defaultSettings;
+    try {
+      const saved = localStorage.getItem('jupyter-ish-settings');
+      if (!saved) return defaultSettings;
+      const parsed = JSON.parse(saved);
+      return { ...defaultSettings, ...(parsed ?? {}) };
+    } catch {
+      return defaultSettings;
+    }
   });
   const cellRefs = useRef<Map<string, HTMLDivElement>>(new Map());
 
   // Save settings to localStorage
   const handleSettingsChange = (newSettings: NotebookSettings) => {
+    const collabChanged =
+      settings.collabEnabled !== newSettings.collabEnabled ||
+      settings.collabServerUrl !== newSettings.collabServerUrl ||
+      settings.collabToken !== newSettings.collabToken ||
+      settings.collabConnectTimeoutMs !== newSettings.collabConnectTimeoutMs;
+
     setSettings(newSettings);
     localStorage.setItem('jupyter-ish-settings', JSON.stringify(newSettings));
+    if (collabChanged) notifyCollabConfigChanged();
   };
 
   const scrollToCell = (cellId: string) => {
@@ -145,8 +164,8 @@ export function Notebook() {
         onInterruptKernel={interruptKernel}
         onToggleSidebar={() => setIsSidebarVisible(!isSidebarVisible)}
         onToggleVariables={() => setIsVariablesVisible(!isVariablesVisible)}
-        onNewNotebook={createNotebook}
-        onLoadNotebook={loadNotebook}
+        onNewNotebook={() => navigate(`/n/${generateNotebookId()}`)}
+        onLoadNotebook={(id) => navigate(`/n/${id}`)}
         onSave={saveCurrentNotebook}
         onTitleChange={updateNotebookTitle}
         onOpenSettings={() => setIsSettingsOpen(true)}
@@ -199,6 +218,8 @@ export function Notebook() {
                       onToggleCollapse={() => toggleOutputCollapse(cell.id)}
                       onExpandPlot={() => cell.output && handleExpandPlot(cell.output)}
                       editorSettings={settings}
+                      yText={getCellYText(cell.id)}
+                      awareness={collabAwareness}
                     />
                   </div>
 
@@ -224,6 +245,8 @@ export function Notebook() {
       <StatusBar
         kernelStatus={kernelStatus}
         kernelKind={kernelKind}
+        collabStatus={collabStatus}
+        collabPeerCount={collabPeerCount}
         lastSaved={lastSaved}
         isDirty={isDirty}
         onRestartKernel={restartKernel}

@@ -1,6 +1,9 @@
-import { useRef, useEffect, useCallback } from 'react';
+import { useRef, useEffect, useCallback, useState } from 'react';
 import Editor, { OnMount, loader } from '@monaco-editor/react';
 import type { editor } from 'monaco-editor';
+import { MonacoBinding } from "y-monaco";
+import type * as Y from "yjs";
+import type { Awareness } from "y-protocols/awareness";
 
 // Configure Monaco loader to avoid module loading issues
 loader.config({
@@ -23,6 +26,8 @@ interface CodeEditorProps {
   tabSize?: number;
   wordWrap?: boolean;
   lineNumbers?: boolean;
+  yText?: Y.Text;
+  awareness?: Awareness;
 }
 
 export function CodeEditor({
@@ -36,8 +41,15 @@ export function CodeEditor({
   tabSize = 4,
   wordWrap = true,
   lineNumbers = true,
+  yText,
+  awareness,
 }: CodeEditorProps) {
   const editorRef = useRef<editor.IStandaloneCodeEditor | null>(null);
+  const bindingRef = useRef<MonacoBinding | null>(null);
+  const contentSizeListenerRef = useRef<{ dispose: () => void } | null>(null);
+  const [measuredHeight, setMeasuredHeight] = useState<number | null>(null);
+  const [editorReady, setEditorReady] = useState(false);
+  const isCollab = Boolean(yText && awareness);
   // Use ref to always have the latest onExecute callback
   const onExecuteRef = useRef(onExecute);
   const onFocusRef = useRef(onFocus);
@@ -51,16 +63,18 @@ export function CodeEditor({
     onFocusRef.current = onFocus;
   }, [onFocus]);
 
-  // Handle keyboard shortcuts - only execute if this editor has focus
-  const handleExecuteShortcut = useCallback((advance: boolean) => {
-    // Check if this editor instance has focus
-    if (editorRef.current?.hasWidgetFocus()) {
-      onExecuteRef.current(advance);
-    }
-  }, []);
-
   const handleEditorMount: OnMount = (editor, monaco) => {
     editorRef.current = editor;
+    setEditorReady(true);
+
+    // Auto-resize based on content (works for both collab + non-collab mode)
+    contentSizeListenerRef.current?.dispose();
+    const updateHeight = () => {
+      const height = editor.getContentHeight();
+      setMeasuredHeight(Math.max(80, height));
+    };
+    updateHeight();
+    contentSizeListenerRef.current = editor.onDidContentSizeChange(updateHeight);
 
     // Define custom theme (only needs to be done once globally, but harmless to repeat)
     monaco.editor.defineTheme('jupyter-dark', {
@@ -123,20 +137,54 @@ export function CodeEditor({
   };
 
   useEffect(() => {
+    return () => {
+      contentSizeListenerRef.current?.dispose();
+      contentSizeListenerRef.current = null;
+      bindingRef.current?.destroy();
+      bindingRef.current = null;
+    };
+  }, []);
+
+  useEffect(() => {
+    const editor = editorRef.current;
+    if (!editorReady || !editor) return;
+
+    if (!yText || !awareness) {
+      bindingRef.current?.destroy();
+      bindingRef.current = null;
+      return;
+    }
+
+    const model = editor.getModel();
+    if (!model) return;
+
+    bindingRef.current?.destroy();
+    bindingRef.current = new MonacoBinding(yText, model, new Set([editor]), awareness);
+
+    return () => {
+      bindingRef.current?.destroy();
+      bindingRef.current = null;
+    };
+  }, [yText, awareness, editorReady]);
+
+  useEffect(() => {
     if (isActive && editorRef.current) {
       editorRef.current.focus();
     }
   }, [isActive]);
 
   const lineHeight = Math.round(fontSize * 1.5);
+  const fallbackHeight = Math.max(80, value.split('\n').length * lineHeight + 24);
+  const height = measuredHeight ?? fallbackHeight;
 
   return (
     <div className="relative">
       <Editor
-        height={Math.max(80, value.split('\n').length * lineHeight + 24)}
+        height={height}
         language={language}
-        value={value}
-        onChange={(val) => onChange(val || '')}
+        value={isCollab ? undefined : value}
+        defaultValue={isCollab ? value : undefined}
+        onChange={isCollab ? undefined : (val) => onChange(val || '')}
         onMount={handleEditorMount}
         options={{
           minimap: { enabled: false },

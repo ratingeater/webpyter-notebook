@@ -11,7 +11,8 @@ const STORAGE_KEY = 'jupyter-ish-notebooks';
 const CURRENT_NOTEBOOK_KEY = 'jupyter-ish-current-notebook';
 
 // Track storage mode
-let useBackendStorage = false;
+// Enabled by default when a compatible backend is configured.
+let useBackendStorage = true;
 
 export function setUseBackendStorage(value: boolean) {
   useBackendStorage = value;
@@ -76,7 +77,8 @@ export function getNotebook(id: string): SavedNotebook | null {
 export async function getNotebookAsync(id: string): Promise<SavedNotebook | null> {
   if (getUseBackendStorage()) {
     try {
-      return await getBackendNotebook(id);
+      const backendNotebook = await getBackendNotebook(id);
+      if (backendNotebook) return backendNotebook;
     } catch (e) {
       console.warn('Failed to get notebook from backend:', e);
     }

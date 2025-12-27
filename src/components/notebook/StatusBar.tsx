@@ -8,6 +8,7 @@ import {
   Clock,
   HardDrive,
   ChevronUp,
+  Users,
 } from 'lucide-react';
 import { KernelStatus } from '@/types/notebook';
 import {
@@ -22,6 +23,8 @@ import { cn } from '@/lib/utils';
 interface StatusBarProps {
   kernelStatus: KernelStatus;
   kernelKind?: 'backend' | 'pyodide' | null;
+  collabStatus?: 'disabled' | 'connecting' | 'connected' | 'fallback';
+  collabPeerCount?: number;
   lastSaved: Date | null;
   isDirty: boolean;
   onRestartKernel: () => void;
@@ -32,6 +35,8 @@ interface StatusBarProps {
 export function StatusBar({
   kernelStatus,
   kernelKind,
+  collabStatus = 'disabled',
+  collabPeerCount = 1,
   lastSaved,
   isDirty,
   onRestartKernel,
@@ -103,6 +108,34 @@ export function StatusBar({
     );
   };
 
+  const getCollabColor = () => {
+    switch (collabStatus) {
+      case 'connected':
+        return 'text-[var(--jupyter-success)]';
+      case 'connecting':
+        return 'text-[var(--jupyter-warning)]';
+      case 'fallback':
+        return 'text-[var(--jupyter-warning)]';
+      case 'disabled':
+      default:
+        return 'text-muted-foreground';
+    }
+  };
+
+  const getCollabText = () => {
+    switch (collabStatus) {
+      case 'connected':
+        return `Collab ${Math.max(1, collabPeerCount)}`;
+      case 'connecting':
+        return 'Collab Connecting…';
+      case 'fallback':
+        return 'Collab Offline';
+      case 'disabled':
+      default:
+        return 'Collab Off';
+    }
+  };
+
   const formatLastSaved = () => {
     if (!lastSaved) return 'Not saved';
     const now = new Date();
@@ -156,6 +189,12 @@ export function StatusBar({
 
         {/* Kernel type badge */}
         {getKernelBadge()}
+
+        {/* Collab status */}
+        <div className={cn('flex items-center gap-1.5', getCollabColor())}>
+          <Users className={cn('w-3 h-3', collabStatus === 'connecting' && 'animate-pulse')} />
+          <span className="font-ui text-xs">{getCollabText()}</span>
+        </div>
 
         {/* Python version */}
         <span className="font-ui text-xs text-muted-foreground">

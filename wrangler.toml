@@ -1,0 +1,12 @@
+name = "webpyter-notebook-collab"
+main = "workers/worker.ts"
+compatibility_date = "2025-12-01"
+
+[durable_objects]
+bindings = [
+  { name = "NOTEBOOK_DO", class_name = "NotebookDO" }
+]
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["NotebookDO"]

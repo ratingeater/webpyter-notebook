@@ -5,20 +5,49 @@ let currentBaseUrl = '';
 
 export type KernelMode = 'backend' | 'pyodide';
 
+function isLocalHostname(hostname: string): boolean {
+  if (!hostname) return false;
+  const normalized = hostname.toLowerCase();
+  return (
+    normalized === 'localhost' ||
+    normalized === '127.0.0.1' ||
+    normalized === '::1' ||
+    normalized === '[::1]' ||
+    normalized.endsWith('.localhost')
+  );
+}
+
+function shouldIgnoreEnvBackendUrl(envUrl: string): boolean {
+  if (!envUrl) return false;
+  try {
+    const parsed = new URL(envUrl);
+    if (!isLocalHostname(parsed.hostname)) return false;
+
+    // If the app is not running on localhost, ignore a localhost default backend URL.
+    const runtimeHost = typeof window !== 'undefined' ? window.location.hostname : '';
+    return !isLocalHostname(runtimeHost);
+  } catch {
+    return false;
+  }
+}
+
 // Get the selected kernel mode from settings
 export function getKernelMode(): KernelMode {
   try {
     const savedSettings = localStorage.getItem('jupyter-ish-settings');
     if (savedSettings) {
       const settings = JSON.parse(savedSettings);
-      if (settings.kernelMode === 'pyodide') {
-        return 'pyodide';
-      }
+      if (settings.kernelMode === 'backend' || settings.kernelMode === 'pyodide') return settings.kernelMode;
     }
   } catch {
     // Ignore parse errors
   }
-  return 'backend'; // Default to backend mode
+
+  const envDefault = import.meta.env.VITE_DEFAULT_KERNEL_MODE;
+  if (envDefault === 'backend' || envDefault === 'pyodide') return envDefault;
+
+  // Default based on availability: prefer backend if configured, else Pyodide.
+  return getBackendKernelUrl() ? 'backend' : 'pyodide';
 }
 
 // Get backend URL from settings or environment variable
@@ -38,7 +67,9 @@ export function getBackendKernelUrl(): string {
   
   // Fall back to environment variable
   const envUrl = import.meta.env.VITE_BACKEND_KERNEL_URL as string | undefined;
-  return envUrl?.trim() ? envUrl.trim().replace(/\/$/, '') : '';
+  const normalized = envUrl?.trim() ? envUrl.trim().replace(/\/$/, '') : '';
+  if (shouldIgnoreEnvBackendUrl(normalized)) return '';
+  return normalized;
 }
 
 // Check if backend kernel mode is selected
@@ -68,6 +99,9 @@ export type BackendKernelHandshakeResponse = {
   ok: boolean;
   name?: string;
   message?: string;
+  python_version?: string;
+  features?: Record<string, unknown>;
+  endpoints?: Record<string, unknown>;
 };
 
 export type BackendKernelExecuteResponse = {
@@ -90,6 +124,41 @@ export function isBackendKernelConfigured() {
   return isBackendKernelMode() && !!getBackendKernelUrl();
 }
 
+const VALID_OUTPUT_TYPES = new Set<CellOutput['type']>([
+  'text',
+  'plot',
+  'table',
+  'latex',
+  'error',
+  'html',
+]);
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return !!value && typeof value === 'object' && !Array.isArray(value);
+}
+
+function looksLikeCollabWorker(payload: unknown): boolean {
+  if (!isRecord(payload)) return false;
+  const endpoints = payload.endpoints;
+  if (isRecord(endpoints) && (typeof endpoints.websocket === 'string' || typeof endpoints.health === 'string')) {
+    return true;
+  }
+  const message = payload.message;
+  return typeof message === 'string' && message.toLowerCase().includes('collaboration worker');
+}
+
+function assertCellOutput(value: unknown): asserts value is CellOutput {
+  if (!isRecord(value)) throw new Error('Backend returned invalid output (not an object)');
+  const type = value.type;
+  const content = value.content;
+  if (typeof type !== 'string' || !VALID_OUTPUT_TYPES.has(type as CellOutput['type'])) {
+    throw new Error('Backend returned invalid output.type');
+  }
+  if (typeof content !== 'string') {
+    throw new Error('Backend returned invalid output.content');
+  }
+}
+
 export function createBackendKernelClient(): KernelClient {
   return {
     kind: 'backend',
@@ -99,23 +168,55 @@ export function createBackendKernelClient(): KernelClient {
       currentBaseUrl = url;
       const data = await fetchJson<BackendKernelHandshakeResponse>('/health');
       if (!data?.ok) throw new Error(data?.message || 'Backend kernel health check failed');
+      if (looksLikeCollabWorker(data)) {
+        throw new Error(
+          'Backend URL points to the collaboration Worker (WebSocket API), not a Python kernel server. ' +
+            'Set the backend URL to your Python kernel server (e.g. http(s)://host:5000) and configure collaboration separately via VITE_COLLAB_WS_URL.'
+        );
+      }
       backendReady = true;
     },
     isLoaded: () => backendReady,
     execute: async (code: string) => {
-      const data = await fetchJson<BackendKernelExecuteResponse>('/execute', {
+      const data = await fetchJson<BackendKernelExecuteResponse | Record<string, unknown>>('/execute', {
         method: 'POST',
         body: JSON.stringify({ code }),
       });
-      return data.output;
+      if (looksLikeCollabWorker(data)) {
+        throw new Error(
+          'Backend URL points to the collaboration Worker (WebSocket API), not a Python kernel server. ' +
+            'Please set the backend URL to your Python kernel server.'
+        );
+      }
+      const output = (data as BackendKernelExecuteResponse).output;
+      assertCellOutput(output);
+      return output;
     },
     getVariables: async () => {
-      const data = await fetchJson<BackendKernelVariablesResponse>('/variables');
-      return data.variables;
+      const data = await fetchJson<BackendKernelVariablesResponse | Record<string, unknown>>('/variables');
+      if (looksLikeCollabWorker(data)) {
+        throw new Error(
+          'Backend URL points to the collaboration Worker (WebSocket API), not a Python kernel server. ' +
+            'Please set the backend URL to your Python kernel server.'
+        );
+      }
+      const variables = (data as BackendKernelVariablesResponse).variables;
+      if (!Array.isArray(variables)) {
+        throw new Error('Backend returned invalid variables payload');
+      }
+      return variables;
     },
     restart: async () => {
-      const data = await fetchJson<BackendKernelRestartResponse>('/restart', { method: 'POST' });
-      if (!data.ok) throw new Error('Restart failed');
+      const data = await fetchJson<BackendKernelRestartResponse | Record<string, unknown>>('/restart', {
+        method: 'POST',
+      });
+      if (looksLikeCollabWorker(data)) {
+        throw new Error(
+          'Backend URL points to the collaboration Worker (WebSocket API), not a Python kernel server. ' +
+            'Please set the backend URL to your Python kernel server.'
+        );
+      }
+      if (!(data as BackendKernelRestartResponse).ok) throw new Error('Restart failed');
       backendReady = true;
     },
     interrupt: () => {

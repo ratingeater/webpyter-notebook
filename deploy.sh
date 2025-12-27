@@ -16,6 +16,10 @@ NC='\033[0m' # No Color
 # Default ports
 BACKEND_PORT=${BACKEND_PORT:-5000}
 FRONTEND_PORT=${FRONTEND_PORT:-5173}
+WORKER_PORT=${WORKER_PORT:-8787}
+
+# Optional collab mode (starts Worker+DO locally and configures frontend to connect)
+ENABLE_COLLAB=${ENABLE_COLLAB:-0}
 
 # Directories
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -26,6 +30,7 @@ WORKSPACE_DIR="${WORKSPACE_DIR:-$HOME/workspace}"
 # PID files
 BACKEND_PID_FILE="/tmp/jupyter-ish-backend.pid"
 FRONTEND_PID_FILE="/tmp/jupyter-ish-frontend.pid"
+WORKER_PID_FILE="/tmp/jupyter-ish-worker.pid"
 
 print_header() {
     echo -e "${BLUE}"
@@ -45,6 +50,36 @@ print_warning() {
 
 print_error() {
     echo -e "${RED}[✗]${NC} $1"
+}
+
+# Upsert KEY=VALUE into .env (preserves other lines/comments)
+upsert_env_var() {
+    local key="$1"
+    local value="$2"
+    python - "$key" "$value" <<'PY'
+import re
+import sys
+from pathlib import Path
+
+key, value = sys.argv[1], sys.argv[2]
+path = Path(".env")
+lines = path.read_text(encoding="utf-8").splitlines() if path.exists() else []
+
+out = []
+found = False
+pattern = re.compile(rf"^{re.escape(key)}=")
+for line in lines:
+    if pattern.match(line):
+        out.append(f"{key}={value}")
+        found = True
+    else:
+        out.append(line)
+
+if not found:
+    out.append(f"{key}={value}")
+
+path.write_text("\n".join(out) + "\n", encoding="utf-8")
+PY
 }
 
 # Check if a port is in use
@@ -133,9 +168,12 @@ start_frontend() {
     
     cd "$SCRIPT_DIR"
     
-    # Update .env with backend URL if needed
-    if [ ! -f ".env" ] || ! grep -q "VITE_BACKEND_KERNEL_URL" ".env"; then
-        echo "VITE_BACKEND_KERNEL_URL=http://localhost:$BACKEND_PORT" > .env
+    # Always sync .env with backend URL (supports custom BACKEND_PORT)
+    upsert_env_var "VITE_BACKEND_KERNEL_URL" "http://localhost:$BACKEND_PORT"
+
+    # Configure collab websocket URL only when enabled
+    if [ "$ENABLE_COLLAB" = "1" ]; then
+        upsert_env_var "VITE_COLLAB_WS_URL" "ws://localhost:$WORKER_PORT/ws"
     fi
     
     # Start frontend
@@ -154,6 +192,35 @@ start_frontend() {
     done
     
     print_error "Frontend failed to start. Check /tmp/jupyter-ish-frontend.log for details."
+    return 1
+}
+
+# Start Durable Objects websocket Worker (optional)
+start_worker() {
+    print_status "Starting collab Worker (Durable Objects) on port $WORKER_PORT..."
+
+    if check_port $WORKER_PORT; then
+        print_warning "Port $WORKER_PORT is in use, stopping existing process..."
+        kill_port $WORKER_PORT
+    fi
+
+    cd "$SCRIPT_DIR"
+
+    # Start worker (local mode)
+    npm run worker:dev -- --local --port $WORKER_PORT > /tmp/jupyter-ish-worker.log 2>&1 &
+    echo $! > "$WORKER_PID_FILE"
+
+    local retries=30
+    while [ $retries -gt 0 ]; do
+        if curl -s "http://127.0.0.1:$WORKER_PORT/api/health" > /dev/null 2>&1; then
+            print_status "Collab Worker is ready!"
+            return 0
+        fi
+        sleep 0.5
+        retries=$((retries - 1))
+    done
+
+    print_error "Collab Worker failed to start. Check /tmp/jupyter-ish-worker.log for details."
     return 1
 }
 
@@ -192,6 +259,12 @@ stop_services() {
         rm -f "$FRONTEND_PID_FILE"
     fi
     kill_port $FRONTEND_PORT
+
+    if [ -f "$WORKER_PID_FILE" ]; then
+        kill $(cat "$WORKER_PID_FILE") 2>/dev/null || true
+        rm -f "$WORKER_PID_FILE"
+    fi
+    kill_port $WORKER_PORT
     
     print_status "All services stopped."
 }
@@ -213,6 +286,14 @@ show_status() {
     else
         echo -e "Frontend: ${RED}○ Stopped${NC}"
     fi
+
+    if [ "$ENABLE_COLLAB" = "1" ]; then
+        if check_port $WORKER_PORT; then
+            echo -e "Collab:   ${GREEN}● Running${NC} on port $WORKER_PORT"
+        else
+            echo -e "Collab:   ${RED}○ Stopped${NC}"
+        fi
+    fi
     
     echo ""
 }
@@ -224,6 +305,9 @@ show_urls() {
     echo "─────────────────────────────────────────"
     echo -e "Frontend:  ${GREEN}http://localhost:$FRONTEND_PORT${NC}"
     echo -e "Backend:   ${GREEN}http://localhost:$BACKEND_PORT${NC}"
+    if [ "$ENABLE_COLLAB" = "1" ]; then
+        echo -e "Collab:    ${GREEN}ws://localhost:$WORKER_PORT/ws${NC}"
+    fi
     echo ""
     echo -e "${YELLOW}Tip:${NC} Open the frontend URL in your browser."
     echo "     Go to Settings → Python Kernel → Enter backend URL"
@@ -243,6 +327,11 @@ deploy() {
     
     # Start backend
     start_backend
+
+    # Start collab worker (optional)
+    if [ "$ENABLE_COLLAB" = "1" ]; then
+        start_worker
+    fi
     
     # Start frontend
     if [ "$mode" = "prod" ] || [ "$mode" = "production" ]; then
@@ -276,6 +365,8 @@ show_help() {
     echo "Environment Variables:"
     echo "  BACKEND_PORT   Backend server port (default: 5000)"
     echo "  FRONTEND_PORT  Frontend server port (default: 5173)"
+    echo "  ENABLE_COLLAB  Start collab Worker+DO (default: 0)"
+    echo "  WORKER_PORT    Collab Worker port (default: 8787)"
     echo "  NOTEBOOKS_DIR  Notebooks storage directory (default: ~/notebooks)"
     echo "  WORKSPACE_DIR  Kernel working directory (default: ~/workspace)"
     echo ""
@@ -284,6 +375,7 @@ show_help() {
     echo "  $0 prod               # Start in production mode"
     echo "  $0 stop               # Stop all services"
     echo "  BACKEND_PORT=8000 $0  # Use custom port"
+    echo "  ENABLE_COLLAB=1 $0    # Start with local collab worker"
     echo ""
 }
 

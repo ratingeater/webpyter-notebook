@@ -13,6 +13,8 @@ import {
   Edit2,
   Check,
   X,
+  Trash2,
+  Loader2,
 } from 'lucide-react';
 import {
   DropdownMenu,
@@ -22,7 +24,7 @@ import {
   DropdownMenuTrigger,
 } from '@/components/ui/dropdown-menu';
 import { cn } from '@/lib/utils';
-import { getAllNotebooks, exportNotebookAsIpynb } from '@/lib/notebook-storage';
+import { getAllNotebooksAsync, deleteNotebookAsync, exportNotebookAsIpynb } from '@/lib/notebook-storage';
 import { Cell, NotebookMetadata } from '@/types/notebook';
 
 interface HeaderProps {
@@ -65,6 +67,7 @@ export function Header({
   const [isEditingTitle, setIsEditingTitle] = useState(false);
   const [editedTitle, setEditedTitle] = useState(notebookTitle);
   const [notebooks, setNotebooks] = useState<NotebookMetadata[]>([]);
+  const [isNotebookMenuLoading, setIsNotebookMenuLoading] = useState(false);
 
   const handleTitleEdit = () => {
     setEditedTitle(notebookTitle);
@@ -83,8 +86,22 @@ export function Header({
     setIsEditingTitle(false);
   };
 
-  const handleOpenNotebooks = () => {
-    setNotebooks(getAllNotebooks());
+  const handleOpenNotebooks = async () => {
+    setIsNotebookMenuLoading(true);
+    try {
+      const list = await getAllNotebooksAsync();
+      setNotebooks(list.sort((a, b) => b.updatedAt.getTime() - a.updatedAt.getTime()));
+    } finally {
+      setIsNotebookMenuLoading(false);
+    }
+  };
+
+  const handleDeleteNotebook = async (id: string, title: string) => {
+    const ok = window.confirm(`Delete notebook "${title}"?`);
+    if (!ok) return;
+
+    await deleteNotebookAsync(id);
+    setNotebooks((prev) => prev.filter((nb) => nb.id !== id));
   };
 
   const handleExportIpynb = () => {
@@ -224,7 +241,7 @@ export function Header({
         </button>
 
         {/* Open notebook */}
-        <DropdownMenu onOpenChange={(open) => open && handleOpenNotebooks()}>
+        <DropdownMenu onOpenChange={(open) => open && void handleOpenNotebooks()}>
           <DropdownMenuTrigger asChild>
             <button
               className="p-2 rounded-lg hover:bg-secondary/30 transition-colors"
@@ -237,7 +254,14 @@ export function Header({
             align="end"
             className="glassmorphism border-[var(--jupyter-border)] max-h-64 overflow-y-auto"
           >
-            {notebooks.length === 0 ? (
+            {isNotebookMenuLoading ? (
+              <DropdownMenuItem disabled>
+                <div className="flex items-center gap-2">
+                  <Loader2 className="w-4 h-4 animate-spin" />
+                  Loading…
+                </div>
+              </DropdownMenuItem>
+            ) : notebooks.length === 0 ? (
               <DropdownMenuItem disabled>
                 No saved notebooks
               </DropdownMenuItem>
@@ -245,14 +269,30 @@ export function Header({
               notebooks.map((nb) => (
                 <DropdownMenuItem
                   key={nb.id}
-                  onClick={() => onLoadNotebook(nb.id)}
+                  onSelect={(e) => {
+                    e.preventDefault();
+                    onLoadNotebook(nb.id);
+                  }}
+                  className="flex items-start justify-between gap-3"
                 >
-                  <div className="flex flex-col">
-                    <span className="font-ui text-sm">{nb.title}</span>
+                  <div className="flex flex-col min-w-0">
+                    <span className="font-ui text-sm truncate">{nb.title}</span>
                     <span className="font-ui text-xs text-muted-foreground">
-                      {new Date(nb.updatedAt).toLocaleDateString()}
+                      {nb.updatedAt.toLocaleDateString()}
                     </span>
                   </div>
+                  <button
+                    type="button"
+                    className="p-1 rounded hover:bg-secondary/50 transition-colors"
+                    title="Delete notebook"
+                    onClick={(e) => {
+                      e.preventDefault();
+                      e.stopPropagation();
+                      void handleDeleteNotebook(nb.id, nb.title);
+                    }}
+                  >
+                    <Trash2 className="w-4 h-4 text-muted-foreground hover:text-[var(--jupyter-error)]" />
+                  </button>
                 </DropdownMenuItem>
               ))
             )}

@@ -6,6 +6,8 @@ import { MarkdownRenderer } from './MarkdownRenderer';
 import { CellOutput } from './CellOutput';
 import { CellToolbar } from './CellToolbar';
 import { cn } from '@/lib/utils';
+import type * as Y from "yjs";
+import type { Awareness } from "y-protocols/awareness";
 
 interface NotebookCellProps {
   cell: Cell;
@@ -28,6 +30,8 @@ interface NotebookCellProps {
     wordWrap?: boolean;
     lineNumbers?: boolean;
   };
+  yText?: Y.Text | null;
+  awareness?: Awareness | null;
 }
 
 export function NotebookCell({
@@ -46,6 +50,8 @@ export function NotebookCell({
   onToggleCollapse,
   onExpandPlot,
   editorSettings,
+  yText,
+  awareness,
 }: NotebookCellProps) {
   const [isEditing, setIsEditing] = useState(false);
 
@@ -112,6 +118,8 @@ export function NotebookCell({
             tabSize={editorSettings?.tabSize}
             wordWrap={editorSettings?.wordWrap}
             lineNumbers={editorSettings?.lineNumbers}
+            yText={yText ?? undefined}
+            awareness={awareness ?? undefined}
           />
         ) : isEditing || !cell.content ? (
           <div onBlur={handleBlur}>

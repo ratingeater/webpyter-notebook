@@ -1,106 +1,402 @@
-import { useState, useCallback, useEffect, useRef } from 'react';
-import { Cell, CellType, NotebookState } from '@/types/notebook';
-import type { KernelClient } from '@/lib/kernel-client';
-import { selectKernelClient, reconnectKernel } from '@/lib/kernel-manager';
-import {
-  getNotebook,
-  saveNotebook,
-  saveNotebookAsync,
-  createNewNotebook,
-  getCurrentNotebookId,
-  setCurrentNotebookId,
-  setUseBackendStorage,
-} from '@/lib/notebook-storage';
+import { useState, useCallback, useEffect, useRef } from "react";
+import * as Y from "yjs";
+import { WebsocketProvider } from "y-websocket";
+import { Awareness } from "y-protocols/awareness";
 
-const generateId = () => Math.random().toString(36).substring(2, 11);
+import type { KernelClient } from "@/lib/kernel-client";
+import { selectKernelClient, reconnectKernel } from "@/lib/kernel-manager";
+import { COLLAB_CONFIG_CHANGED_EVENT, getCollabConfig } from "@/lib/collab";
+import { getNotebookAsync, saveNotebookAsync, setCurrentNotebookId } from "@/lib/notebook-storage";
+import type { Cell, CellOutput, CellType, NotebookState } from "@/types/notebook";
 
-const createCell = (type: CellType = 'code', content: string = ''): Cell => ({
-  id: generateId(),
-  type,
-  content,
-  status: 'idle',
-});
-
-const getInitialState = (): NotebookState => {
-  // Try to load current notebook
-  const currentId = getCurrentNotebookId();
-  if (currentId) {
-    const notebook = getNotebook(currentId);
-    if (notebook) {
-      return {
-        cells: notebook.cells,
-        activeCellId: null,
-        kernelStatus: 'disconnected',
-        variables: [],
-        lastSaved: notebook.metadata.updatedAt,
-        isDirty: false,
-        executionCounter: 0,
-        notebookId: notebook.metadata.id,
-        notebookTitle: notebook.metadata.title,
-      };
-    }
-  }
-
-  // Create new notebook
-  const newNotebook = createNewNotebook();
-  return {
-    cells: newNotebook.cells,
-    activeCellId: null,
-    kernelStatus: 'disconnected',
-    variables: [],
-    lastSaved: newNotebook.metadata.updatedAt,
-    isDirty: false,
-    executionCounter: 0,
-    notebookId: newNotebook.metadata.id,
-    notebookTitle: newNotebook.metadata.title,
-  };
+type RuntimeCellState = {
+  status: Cell["status"];
+  output?: CellOutput;
+  executionCount?: number;
+  isCollapsed?: boolean;
 };
 
-export function useNotebook() {
-  const [state, setState] = useState<NotebookState>(getInitialState);
-  const autoSaveRef = useRef<NodeJS.Timeout | null>(null);
-  const [kernelLoadingMessage, setKernelLoadingMessage] = useState<string>('');
-  const [kernelKind, setKernelKind] = useState<'backend' | 'pyodide' | null>(null);
+const generateId = () =>
+  typeof crypto !== "undefined" && "randomUUID" in crypto
+    ? crypto.randomUUID()
+    : Math.random().toString(36).substring(2, 11);
+
+function asCellType(value: unknown): CellType {
+  return value === "markdown" ? "markdown" : "code";
+}
+
+function applyTextDiff(yText: Y.Text, nextValue: string) {
+  const prevValue = yText.toString();
+  if (prevValue === nextValue) return;
+
+  let start = 0;
+  while (
+    start < prevValue.length &&
+    start < nextValue.length &&
+    prevValue[start] === nextValue[start]
+  ) {
+    start += 1;
+  }
+
+  let endPrev = prevValue.length;
+  let endNext = nextValue.length;
+  while (
+    endPrev > start &&
+    endNext > start &&
+    prevValue[endPrev - 1] === nextValue[endNext - 1]
+  ) {
+    endPrev -= 1;
+    endNext -= 1;
+  }
+
+  yText.delete(start, endPrev - start);
+  const insertText = nextValue.slice(start, endNext);
+  if (insertText) yText.insert(start, insertText);
+}
+
+function ensureNotebookInitialized(doc: Y.Doc) {
+  const title = doc.getText("title");
+  const cells = doc.getArray<Y.Map<unknown>>("cells");
+
+  if (title.length === 0) title.insert(0, "Untitled Notebook");
+  if (cells.length > 0) return;
+
+  const mdCell = new Y.Map<unknown>();
+  mdCell.set("id", generateId());
+  mdCell.set("type", "markdown");
+  mdCell.set("content", new Y.Text("# New Notebook\n\nWelcome! Share this URL to collaborate."));
+
+  const codeCell = new Y.Map<unknown>();
+  codeCell.set("id", generateId());
+  codeCell.set("type", "code");
+  codeCell.set("content", new Y.Text("# Write Python code here\n# Shift+Enter to run"));
+
+  cells.push([mdCell, codeCell]);
+}
+
+async function loadNotebookSnapshotIntoDoc(
+  doc: Y.Doc,
+  notebookId: string,
+  shouldAbort?: () => boolean
+) {
+  const saved = await getNotebookAsync(notebookId);
+  if (shouldAbort?.()) return;
+  if (!saved) {
+    ensureNotebookInitialized(doc);
+    return;
+  }
+
+  doc.transact(() => {
+    const yTitle = doc.getText("title");
+    yTitle.delete(0, yTitle.length);
+    yTitle.insert(0, saved.metadata.title || "Untitled Notebook");
+
+    const yCells = doc.getArray<Y.Map<unknown>>("cells");
+    if (yCells.length > 0) yCells.delete(0, yCells.length);
+
+    const nextCells = saved.cells.map((cell) => {
+      const yCell = new Y.Map<unknown>();
+      yCell.set("id", cell.id || generateId());
+      yCell.set("type", cell.type);
+      yCell.set("content", new Y.Text(cell.content || ""));
+      return yCell;
+    });
+
+    if (nextCells.length > 0) {
+      yCells.push(nextCells);
+    }
+  });
+
+  ensureNotebookInitialized(doc);
+}
+
+export function useNotebook(notebookId: string) {
+  const [state, setState] = useState<NotebookState>(() => ({
+    cells: [],
+    activeCellId: null,
+    kernelStatus: "disconnected",
+    variables: [],
+    lastSaved: null,
+    isDirty: false,
+    executionCounter: 0,
+    notebookId,
+    notebookTitle: "Untitled Notebook",
+  }));
+
+  const [kernelLoadingMessage, setKernelLoadingMessage] = useState<string>("");
+  const [kernelKind, setKernelKind] = useState<"backend" | "pyodide" | null>(null);
   const kernelClientRef = useRef<KernelClient | null>(null);
+
+  const [collabAwareness, setCollabAwareness] = useState<Awareness | null>(null);
+  const [collabStatus, setCollabStatus] = useState<"disabled" | "connecting" | "connected" | "fallback">(
+    "disabled"
+  );
+  const [collabPeerCount, setCollabPeerCount] = useState<number>(1);
+
+  const autoSaveRef = useRef<NodeJS.Timeout | null>(null);
+  const runtimeCellStateRef = useRef<Map<string, RuntimeCellState>>(new Map());
+
+  const ydocRef = useRef<Y.Doc | null>(null);
+  const providerRef = useRef<WebsocketProvider | null>(null);
+  const awarenessRef = useRef<Awareness | null>(null);
+  const yCellByIdRef = useRef<Map<string, Y.Map<unknown>>>(new Map());
+  const [collabConfigVersion, setCollabConfigVersion] = useState(0);
 
   // Keep a ref to current state for callbacks to avoid stale closures
   const stateRef = useRef(state);
   stateRef.current = state;
-  
-  // Keep a ref for kernel kind as well (for use in callbacks)
-  const kernelKindRef = useRef(kernelKind);
-  kernelKindRef.current = kernelKind;
+
+  const syncScheduledRef = useRef<number | null>(null);
+  const syncFromDoc = useCallback(() => {
+    const doc = ydocRef.current;
+    if (!doc) return;
+
+    const yTitle = doc.getText("title");
+    const yCells = doc.getArray<Y.Map<unknown>>("cells");
+
+    const nextYCellById = new Map<string, Y.Map<unknown>>();
+    const seenIds = new Set<string>();
+
+    const nextCells: Cell[] = yCells.toArray().map((yCell) => {
+      const id = String(yCell.get("id") ?? "");
+      const type = asCellType(yCell.get("type"));
+      const yText = yCell.get("content") as Y.Text | undefined;
+      const content = yText ? yText.toString() : "";
+
+      nextYCellById.set(id, yCell);
+      seenIds.add(id);
+
+      if (!runtimeCellStateRef.current.has(id)) {
+        runtimeCellStateRef.current.set(id, { status: "idle" });
+      }
+
+      const runtime = runtimeCellStateRef.current.get(id)!;
+      return {
+        id,
+        type,
+        content,
+        status: runtime.status,
+        output: runtime.output,
+        executionCount: runtime.executionCount,
+        isCollapsed: runtime.isCollapsed,
+      };
+    });
+
+    for (const id of Array.from(runtimeCellStateRef.current.keys())) {
+      if (!seenIds.has(id)) runtimeCellStateRef.current.delete(id);
+    }
+
+    yCellByIdRef.current = nextYCellById;
+
+    const title = yTitle.toString() || "Untitled Notebook";
+    setState((prev) => ({
+      ...prev,
+      notebookId,
+      notebookTitle: title,
+      cells: nextCells,
+      activeCellId:
+        prev.activeCellId && nextYCellById.has(prev.activeCellId)
+          ? prev.activeCellId
+          : nextCells[0]?.id ?? null,
+    }));
+  }, [notebookId]);
+
+  const scheduleSyncFromDoc = useCallback(() => {
+    if (syncScheduledRef.current != null) return;
+    syncScheduledRef.current = window.requestAnimationFrame(() => {
+      syncScheduledRef.current = null;
+      syncFromDoc();
+    });
+  }, [syncFromDoc]);
+
+  const getCellYText = useCallback((cellId: string): Y.Text | null => {
+    const yCell = yCellByIdRef.current.get(cellId);
+    const yText = yCell?.get("content");
+    return yText instanceof Y.Text ? yText : null;
+  }, []);
+
+  const setActiveCell = useCallback((cellId: string | null) => {
+    setState((prev) => ({ ...prev, activeCellId: cellId }));
+  }, []);
+
+  useEffect(() => {
+    const handler = () => setCollabConfigVersion((prev) => prev + 1);
+    window.addEventListener(COLLAB_CONFIG_CHANGED_EVENT, handler);
+    return () => window.removeEventListener(COLLAB_CONFIG_CHANGED_EVENT, handler);
+  }, []);
+
+  // Collaboration: connect per-notebookId
+  useEffect(() => {
+    const collab = getCollabConfig();
+    setCollabStatus(collab ? "connecting" : "disabled");
+    setCollabPeerCount(1);
+    setCurrentNotebookId(notebookId);
+    runtimeCellStateRef.current = new Map();
+    yCellByIdRef.current = new Map();
+
+    providerRef.current?.destroy();
+    providerRef.current = null;
+    ydocRef.current?.destroy();
+    ydocRef.current = null;
+    awarenessRef.current = null;
+    setCollabAwareness(null);
+
+    setState((prev) => ({
+      ...prev,
+      notebookId,
+      notebookTitle: "Untitled Notebook",
+      cells: [],
+      activeCellId: null,
+      variables: [],
+      lastSaved: null,
+      isDirty: false,
+      executionCounter: 0,
+    }));
+
+    const doc = new Y.Doc();
+    ydocRef.current = doc;
+    let disposed = false;
+    let detachAwarenessListener: (() => void) | null = null;
+
+    let readyToMarkDirty = false;
+    const onDocUpdate = () => {
+      if (readyToMarkDirty) {
+        setState((prev) => (prev.isDirty ? prev : { ...prev, isDirty: true }));
+      }
+      scheduleSyncFromDoc();
+    };
+
+    doc.on("update", onDocUpdate);
+
+    if (!collab) {
+      const localAwareness = new Awareness(doc);
+      try {
+        localAwareness.setLocalStateField("user", { name: "You" });
+      } catch {
+        // ignore
+      }
+      const syncPeers = () => setCollabPeerCount(Math.max(1, localAwareness.getStates().size));
+      localAwareness.on("update", syncPeers);
+      syncPeers();
+      detachAwarenessListener = () => localAwareness.off("update", syncPeers);
+
+      awarenessRef.current = localAwareness;
+      setCollabAwareness(localAwareness);
+
+      void loadNotebookSnapshotIntoDoc(doc, notebookId, () => disposed).then(() => {
+        if (disposed) return;
+        scheduleSyncFromDoc();
+        readyToMarkDirty = true;
+      });
+
+      return () => {
+        disposed = true;
+        detachAwarenessListener?.();
+        doc.off("update", onDocUpdate);
+        doc.destroy();
+      };
+    }
+
+    const provider = new WebsocketProvider(collab.serverUrl, notebookId, doc, {
+      connect: true,
+      params: collab.params ?? {},
+    });
+    providerRef.current = provider;
+
+    try {
+      provider.awareness.setLocalStateField("user", { name: "You" });
+    } catch {
+      // ignore
+    }
+    const syncPeers = () => setCollabPeerCount(Math.max(1, provider.awareness.getStates().size));
+    provider.awareness.on("update", syncPeers);
+    syncPeers();
+    detachAwarenessListener = () => provider.awareness.off("update", syncPeers);
+
+    awarenessRef.current = provider.awareness;
+    setCollabAwareness(provider.awareness);
+
+    let synced = false;
+    const onSync = (isSynced: boolean) => {
+      if (!isSynced) return;
+      synced = true;
+      setCollabStatus("connected");
+      ensureNotebookInitialized(doc);
+      scheduleSyncFromDoc();
+      readyToMarkDirty = true;
+    };
+
+    provider.on("sync", onSync);
+
+    const fallbackTimer = window.setTimeout(() => {
+      if (synced) return;
+
+      provider.destroy();
+      providerRef.current = null;
+      detachAwarenessListener?.();
+      detachAwarenessListener = null;
+      setCollabStatus("fallback");
+
+      const localAwareness = new Awareness(doc);
+      try {
+        localAwareness.setLocalStateField("user", { name: "You" });
+      } catch {
+        // ignore
+      }
+      const syncLocalPeers = () => setCollabPeerCount(Math.max(1, localAwareness.getStates().size));
+      localAwareness.on("update", syncLocalPeers);
+      syncLocalPeers();
+      detachAwarenessListener = () => localAwareness.off("update", syncLocalPeers);
+      awarenessRef.current = localAwareness;
+      setCollabAwareness(localAwareness);
+
+      void loadNotebookSnapshotIntoDoc(doc, notebookId, () => disposed).then(() => {
+        if (disposed) return;
+        scheduleSyncFromDoc();
+        readyToMarkDirty = true;
+      });
+    }, collab.connectTimeoutMs);
+
+    scheduleSyncFromDoc();
+
+    return () => {
+      disposed = true;
+      window.clearTimeout(fallbackTimer);
+      doc.off("update", onDocUpdate);
+      detachAwarenessListener?.();
+      provider.destroy();
+      doc.destroy();
+    };
+  }, [notebookId, collabConfigVersion, scheduleSyncFromDoc]);
 
   // Initialize kernel on mount
   useEffect(() => {
     const initKernel = async () => {
-      // Delay kernel loading to let UI render first (use requestIdleCallback if available)
       const startLoading = () => {
-        setState((prev) => ({ ...prev, kernelStatus: 'loading' }));
+        setState((prev) => ({ ...prev, kernelStatus: "loading" }));
 
         selectKernelClient((message) => setKernelLoadingMessage(message))
           .then((client) => {
             kernelClientRef.current = client;
             setKernelKind(client.kind);
-            // Enable backend storage when connected to backend
-            setUseBackendStorage(client.kind === 'backend');
-            setState((prev) => ({ ...prev, kernelStatus: 'idle' }));
-            setKernelLoadingMessage('');
+            setState((prev) => ({ ...prev, kernelStatus: "idle" }));
+            setKernelLoadingMessage("");
           })
           .catch((error) => {
-            console.error('Failed to initialize kernel:', error);
+            console.error("Failed to initialize kernel:", error);
             kernelClientRef.current = null;
             setKernelKind(null);
-            setUseBackendStorage(false);
-            setState((prev) => ({ ...prev, kernelStatus: 'disconnected' }));
-            // Show error message to user
-            const errorMsg = error instanceof Error ? error.message : 'Failed to connect to kernel';
+            setState((prev) => ({ ...prev, kernelStatus: "disconnected" }));
+            const errorMsg =
+              error instanceof Error ? error.message : "Failed to connect to kernel";
             setKernelLoadingMessage(errorMsg);
           });
       };
 
-      if ('requestIdleCallback' in window) {
-        (window as unknown as { requestIdleCallback: (cb: () => void) => void }).requestIdleCallback(startLoading);
+      if ("requestIdleCallback" in window) {
+        (window as unknown as { requestIdleCallback: (cb: () => void) => void }).requestIdleCallback(
+          startLoading
+        );
       } else {
         setTimeout(startLoading, 100);
       }
@@ -109,110 +405,135 @@ export function useNotebook() {
     initKernel();
   }, []);
 
-  // Auto-save every 30 seconds
+  // Auto-save local snapshot every 30 seconds (client-side backup)
   useEffect(() => {
     autoSaveRef.current = setInterval(() => {
-      if (state.isDirty) {
-        // Use async save to support backend storage
-        saveNotebookAsync(
-          state.notebookId,
-          state.notebookTitle,
-          state.cells,
-          state.variables
-        ).then(() => {
-          setState((prev) => ({
-            ...prev,
-            lastSaved: new Date(),
-            isDirty: false,
-          }));
-        });
-      }
+      if (!stateRef.current.isDirty) return;
+
+      const doc = ydocRef.current;
+      if (!doc) return;
+
+      const yTitle = doc.getText("title");
+      const yCells = doc.getArray<Y.Map<unknown>>("cells");
+
+      const snapshotCells: Cell[] = yCells.toArray().map((yCell) => {
+        const id = String(yCell.get("id") ?? generateId());
+        const type = asCellType(yCell.get("type"));
+        const yText = yCell.get("content") as Y.Text | undefined;
+        const content = yText ? yText.toString() : "";
+        return { id, type, content, status: "idle" };
+      });
+
+      void saveNotebookAsync(notebookId, yTitle.toString() || "Untitled Notebook", snapshotCells, []);
+
+      setState((prev) => ({
+        ...prev,
+        lastSaved: new Date(),
+        isDirty: false,
+      }));
     }, 30000);
 
     return () => {
-      if (autoSaveRef.current) {
-        clearInterval(autoSaveRef.current);
-      }
+      if (autoSaveRef.current) clearInterval(autoSaveRef.current);
     };
-  }, [state.isDirty, state.notebookId, state.notebookTitle, state.cells, state.variables]);
-
-  const setActiveCell = useCallback((cellId: string | null) => {
-    setState(prev => ({ ...prev, activeCellId: cellId }));
-  }, []);
+  }, [notebookId]);
 
   const updateCellContent = useCallback((cellId: string, content: string) => {
-    setState(prev => ({
+    const yText = getCellYText(cellId);
+    if (yText) applyTextDiff(yText, content);
+
+    setState((prev) => ({
       ...prev,
       isDirty: true,
-      cells: prev.cells.map(cell =>
-        cell.id === cellId ? { ...cell, content } : cell
-      ),
+      cells: prev.cells.map((cell) => (cell.id === cellId ? { ...cell, content } : cell)),
     }));
-  }, []);
+  }, [getCellYText]);
 
-  const addCell = useCallback((afterCellId: string | null, type: CellType = 'code') => {
-    const newCell = createCell(type);
-    setState(prev => {
-      const index = afterCellId
-        ? prev.cells.findIndex(c => c.id === afterCellId) + 1
-        : prev.cells.length;
-      const newCells = [...prev.cells];
-      newCells.splice(index, 0, newCell);
-      return {
-        ...prev,
-        cells: newCells,
-        activeCellId: newCell.id,
-        isDirty: true,
-      };
-    });
-    return newCell.id;
-  }, []);
+  const addCell = useCallback((afterCellId: string | null, type: CellType = "code") => {
+    const doc = ydocRef.current;
+    if (!doc) return "";
+
+    const yCells = doc.getArray<Y.Map<unknown>>("cells");
+
+    const newCellId = generateId();
+    const yCell = new Y.Map<unknown>();
+    yCell.set("id", newCellId);
+    yCell.set("type", type);
+    yCell.set("content", new Y.Text(""));
+
+    const index = afterCellId
+      ? yCells.toArray().findIndex((c) => c.get("id") === afterCellId) + 1
+      : yCells.length;
+
+    yCells.insert(Math.max(0, index), [yCell]);
+
+    runtimeCellStateRef.current.set(newCellId, { status: "idle" });
+    setActiveCell(newCellId);
+    setState((prev) => ({ ...prev, isDirty: true }));
+
+    return newCellId;
+  }, [setActiveCell]);
 
   const deleteCell = useCallback((cellId: string) => {
-    setState(prev => {
-      if (prev.cells.length <= 1) return prev;
-      const index = prev.cells.findIndex(c => c.id === cellId);
-      const newCells = prev.cells.filter(c => c.id !== cellId);
-      const newActiveId = newCells[Math.min(index, newCells.length - 1)]?.id || null;
-      return {
-        ...prev,
-        cells: newCells,
-        activeCellId: newActiveId,
-        isDirty: true,
-      };
-    });
+    const doc = ydocRef.current;
+    if (!doc) return;
+
+    const yCells = doc.getArray<Y.Map<unknown>>("cells");
+    if (yCells.length <= 1) return;
+
+    const index = yCells.toArray().findIndex((c) => c.get("id") === cellId);
+    if (index < 0) return;
+
+    yCells.delete(index, 1);
+    runtimeCellStateRef.current.delete(cellId);
+
+    setState((prev) => ({ ...prev, isDirty: true }));
   }, []);
 
-  const moveCell = useCallback((cellId: string, direction: 'up' | 'down') => {
-    setState(prev => {
-      const index = prev.cells.findIndex(c => c.id === cellId);
-      if (
-        (direction === 'up' && index === 0) ||
-        (direction === 'down' && index === prev.cells.length - 1)
-      ) {
-        return prev;
-      }
-      const newCells = [...prev.cells];
-      const targetIndex = direction === 'up' ? index - 1 : index + 1;
-      [newCells[index], newCells[targetIndex]] = [newCells[targetIndex], newCells[index]];
-      return { ...prev, cells: newCells, isDirty: true };
-    });
+  const moveCell = useCallback((cellId: string, direction: "up" | "down") => {
+    const doc = ydocRef.current;
+    if (!doc) return;
+
+    const yCells = doc.getArray<Y.Map<unknown>>("cells");
+    const index = yCells.toArray().findIndex((c) => c.get("id") === cellId);
+    if (index < 0) return;
+
+    const targetIndex = direction === "up" ? index - 1 : index + 1;
+    if (targetIndex < 0 || targetIndex >= yCells.length) return;
+
+    const yCell = yCells.get(index);
+    yCells.delete(index, 1);
+    yCells.insert(targetIndex, [yCell]);
+
+    setState((prev) => ({ ...prev, isDirty: true }));
   }, []);
 
   const changeCellType = useCallback((cellId: string, type: CellType) => {
-    setState(prev => ({
+    const yCell = yCellByIdRef.current.get(cellId);
+    if (!yCell) return;
+
+    yCell.set("type", type);
+
+    const runtime = runtimeCellStateRef.current.get(cellId) ?? { status: "idle" };
+    runtime.output = undefined;
+    runtime.status = "idle";
+    runtime.executionCount = undefined;
+    runtimeCellStateRef.current.set(cellId, runtime);
+
+    setState((prev) => ({
       ...prev,
       isDirty: true,
-      cells: prev.cells.map(cell =>
-        cell.id === cellId ? { ...cell, type, output: undefined } : cell
-      ),
+      cells: prev.cells.map((c) => (c.id === cellId ? { ...c, type, output: undefined } : c)),
     }));
   }, []);
 
   const toggleOutputCollapse = useCallback((cellId: string) => {
-    setState(prev => ({
+    const runtime = runtimeCellStateRef.current.get(cellId);
+    if (runtime) runtime.isCollapsed = !runtime.isCollapsed;
+
+    setState((prev) => ({
       ...prev,
-      cells: prev.cells.map(cell =>
+      cells: prev.cells.map((cell) =>
         cell.id === cellId ? { ...cell, isCollapsed: !cell.isCollapsed } : cell
       ),
     }));
@@ -220,11 +541,11 @@ export function useNotebook() {
 
   const executeCell = useCallback(
     async (cellId: string, advance: boolean = true) => {
-      // Use ref to get current cells to avoid stale closure
       const currentCells = stateRef.current.cells;
-
       const cell = currentCells.find((c) => c.id === cellId);
-      if (!cell || cell.type === 'markdown') {
+      if (!cell) return;
+
+      if (cell.type === "markdown") {
         if (advance) {
           const index = currentCells.findIndex((c) => c.id === cellId);
           const nextCell = currentCells[index + 1];
@@ -245,10 +566,10 @@ export function useNotebook() {
             c.id === cellId
               ? {
                   ...c,
-                  status: 'error',
+                  status: "error",
                   output: {
-                    type: 'error',
-                    content: 'Python kernel is not loaded. Please wait for it to initialize.',
+                    type: "error",
+                    content: "Python kernel is not loaded. Please wait for it to initialize.",
                   },
                 }
               : c
@@ -257,207 +578,169 @@ export function useNotebook() {
         return;
       }
 
-      // Set running state and get latest content
-      let latestContent = cell.content;
-      setState((prev) => {
-        const latestCell = prev.cells.find((c) => c.id === cellId);
-        if (latestCell) {
-          latestContent = latestCell.content;
-        }
-        return {
-          ...prev,
-          kernelStatus: 'busy',
-          cells: prev.cells.map((c) =>
-            c.id === cellId ? { ...c, status: 'running', output: undefined } : c
-          ),
-        };
-      });
+      const code = getCellYText(cellId)?.toString() ?? cell.content;
+
+      // Set running state
+      runtimeCellStateRef.current.set(cellId, {
+        ...runtimeCellStateRef.current.get(cellId),
+        status: "running",
+        output: undefined,
+      } as RuntimeCellState);
+
+      setState((prev) => ({
+        ...prev,
+        kernelStatus: "busy",
+        isDirty: true,
+        cells: prev.cells.map((c) =>
+          c.id === cellId ? { ...c, status: "running", output: undefined } : c
+        ),
+      }));
 
       try {
-        const kernel = kernelClientRef.current;
-        if (!kernel) throw new Error('Kernel not initialized');
-
-        // Execute code (backend preferred, Pyodide fallback)
-        const output = await kernel.execute(latestContent);
-
-        // Get updated variables
+        const output = await kernel.execute(code);
+        if (!output || typeof output !== "object" || typeof (output as { type?: unknown }).type !== "string") {
+          throw new Error("Kernel returned invalid output");
+        }
         const variables = await kernel.getVariables();
 
         setState((prev) => {
-          // Handle advance logic inside setState to use latest state
+          const nextExecution = prev.executionCounter + 1;
+          runtimeCellStateRef.current.set(cellId, {
+            ...runtimeCellStateRef.current.get(cellId),
+            status: output.type === "error" ? "error" : "success",
+            output,
+            executionCount: nextExecution,
+          } as RuntimeCellState);
+
           if (advance) {
             const index = prev.cells.findIndex((c) => c.id === cellId);
             const nextCell = prev.cells[index + 1];
             if (nextCell) {
-              // Schedule setActiveCell after state update
               setTimeout(() => setActiveCell(nextCell.id), 0);
             } else {
-              // Schedule addCell after state update
               setTimeout(() => addCell(cellId), 0);
             }
           }
 
           return {
             ...prev,
-            kernelStatus: 'idle',
-            executionCounter: prev.executionCounter + 1,
+            kernelStatus: "idle",
+            executionCounter: nextExecution,
             variables,
             cells: prev.cells.map((c) =>
               c.id === cellId
                 ? {
                     ...c,
-                    status: output.type === 'error' ? 'error' : 'success',
+                    status: output.type === "error" ? "error" : "success",
                     output,
-                    executionCount: prev.executionCounter + 1,
+                    executionCount: nextExecution,
                   }
                 : c
             ),
           };
         });
       } catch (error) {
+        const message = error instanceof Error ? error.message : "Execution failed";
+        runtimeCellStateRef.current.set(cellId, {
+          ...runtimeCellStateRef.current.get(cellId),
+          status: "error",
+          output: { type: "error", content: message },
+        } as RuntimeCellState);
+
         setState((prev) => ({
           ...prev,
-          kernelStatus: 'idle',
+          kernelStatus: "idle",
           cells: prev.cells.map((c) =>
-            c.id === cellId
-              ? {
-                  ...c,
-                  status: 'error',
-                  output: {
-                    type: 'error',
-                    content:
-                      error instanceof Error ? error.message : 'Execution failed',
-                  },
-                }
-              : c
+            c.id === cellId ? { ...c, status: "error", output: { type: "error", content: message } } : c
           ),
         }));
       }
     },
-    [state.cells, setActiveCell, addCell]
+    [addCell, getCellYText, setActiveCell]
   );
 
   const restartKernel = useCallback(async () => {
     setState((prev) => ({
       ...prev,
-      kernelStatus: 'starting',
+      kernelStatus: "starting",
       variables: [],
+      executionCounter: 0,
       cells: prev.cells.map((c) => ({
         ...c,
-        status: 'idle',
+        status: "idle",
         output: undefined,
         executionCount: undefined,
       })),
     }));
 
+    runtimeCellStateRef.current.forEach((v) => {
+      v.status = "idle";
+      v.output = undefined;
+      v.executionCount = undefined;
+    });
+
     try {
       const kernel = kernelClientRef.current;
-      if (!kernel) throw new Error('Kernel not initialized');
+      if (!kernel) throw new Error("Kernel not initialized");
       await kernel.restart();
-      setState((prev) => ({ ...prev, kernelStatus: 'idle', executionCounter: 0 }));
+      setState((prev) => ({ ...prev, kernelStatus: "idle" }));
     } catch (error) {
-      console.error('Failed to restart kernel:', error);
-      setState((prev) => ({ ...prev, kernelStatus: 'idle' }));
+      console.error("Failed to restart kernel:", error);
+      setState((prev) => ({ ...prev, kernelStatus: "idle" }));
     }
   }, []);
 
   const interruptKernel = useCallback(() => {
     kernelClientRef.current?.interrupt();
 
-    // Update UI state
+    runtimeCellStateRef.current.forEach((v) => {
+      if (v.status === "running") v.status = "idle";
+    });
+
     setState((prev) => ({
       ...prev,
-      kernelStatus: 'idle',
-      cells: prev.cells.map((c) =>
-        c.status === 'running' ? { ...c, status: 'idle' } : c
-      ),
+      kernelStatus: "idle",
+      cells: prev.cells.map((c) => (c.status === "running" ? { ...c, status: "idle" } : c)),
     }));
   }, []);
 
-  // Reconnect to kernel (used when settings change)
   const reconnectToKernel = useCallback(async () => {
-    // Immediately update UI to show we're reconnecting
     kernelClientRef.current = null;
     setKernelKind(null);
-    setState((prev) => ({ ...prev, kernelStatus: 'loading' }));
-    setKernelLoadingMessage('Reconnecting to kernel...');
+    setState((prev) => ({ ...prev, kernelStatus: "loading" }));
+    setKernelLoadingMessage("Reconnecting to kernel...");
 
     try {
       const client = await reconnectKernel((message) => setKernelLoadingMessage(message));
       kernelClientRef.current = client;
       setKernelKind(client.kind);
-      
-      // Enable backend storage when connected to backend
-      setUseBackendStorage(client.kind === 'backend');
-      
-      // Update state
-      setState((prev) => ({ 
-        ...prev, 
-        kernelStatus: 'idle',
-        variables: [], // Clear variables on reconnect
+
+      setState((prev) => ({
+        ...prev,
+        kernelStatus: "idle",
+        variables: [],
       }));
-      setKernelLoadingMessage('');
-      
+      setKernelLoadingMessage("");
       return client.kind;
     } catch (error) {
-      console.error('Failed to reconnect kernel:', error);
+      console.error("Failed to reconnect kernel:", error);
       kernelClientRef.current = null;
       setKernelKind(null);
-      setUseBackendStorage(false);
-      setState((prev) => ({ ...prev, kernelStatus: 'disconnected' }));
-      const errorMsg = error instanceof Error ? error.message : 'Failed to reconnect to kernel';
+      setState((prev) => ({ ...prev, kernelStatus: "disconnected" }));
+      const errorMsg = error instanceof Error ? error.message : "Failed to reconnect to kernel";
       setKernelLoadingMessage(errorMsg);
       return null;
     }
   }, []);
 
-  // Get current kernel kind (for external use, returns from ref for immediate access)
   const getKernelKind = useCallback(() => kernelKind, [kernelKind]);
 
-  const reorderCells = useCallback((startIndex: number, endIndex: number) => {
-    setState((prev) => {
-      const newCells = [...prev.cells];
-      const [removed] = newCells.splice(startIndex, 1);
-      newCells.splice(endIndex, 0, removed);
-      return { ...prev, cells: newCells, isDirty: true };
-    });
-  }, []);
-
-  const createNotebook = useCallback(() => {
-    const newNotebook = createNewNotebook();
-    setState({
-      cells: newNotebook.cells,
-      activeCellId: null,
-      kernelStatus: kernelClientRef.current?.isLoaded() ? 'idle' : 'disconnected',
-      variables: [],
-      lastSaved: newNotebook.metadata.updatedAt,
-      isDirty: false,
-      executionCounter: 0,
-      notebookId: newNotebook.metadata.id,
-      notebookTitle: newNotebook.metadata.title,
-    });
-    return newNotebook.metadata.id;
-  }, []);
-
-  const loadNotebook = useCallback((notebookId: string) => {
-    const notebook = getNotebook(notebookId);
-    if (notebook) {
-      setCurrentNotebookId(notebookId);
-      setState({
-        cells: notebook.cells,
-        activeCellId: null,
-        kernelStatus: kernelClientRef.current?.isLoaded() ? 'idle' : 'disconnected',
-        variables: [],
-        lastSaved: notebook.metadata.updatedAt,
-        isDirty: false,
-        executionCounter: 0,
-        notebookId: notebook.metadata.id,
-        notebookTitle: notebook.metadata.title,
-      });
-    }
-  }, []);
-
   const updateNotebookTitle = useCallback((title: string) => {
+    const doc = ydocRef.current;
+    if (!doc) return;
+    const yTitle = doc.getText("title");
+    applyTextDiff(yTitle, title);
+
     setState((prev) => ({
       ...prev,
       notebookTitle: title,
@@ -466,23 +749,32 @@ export function useNotebook() {
   }, []);
 
   const saveCurrentNotebook = useCallback(async () => {
-    await saveNotebookAsync(
-      state.notebookId,
-      state.notebookTitle,
-      state.cells,
-      state.variables
-    );
-    setState((prev) => ({
-      ...prev,
-      lastSaved: new Date(),
-      isDirty: false,
-    }));
-  }, [state.notebookId, state.notebookTitle, state.cells, state.variables]);
+    const doc = ydocRef.current;
+    if (!doc) return;
+
+    const yTitle = doc.getText("title");
+    const yCells = doc.getArray<Y.Map<unknown>>("cells");
+
+    const snapshotCells: Cell[] = yCells.toArray().map((yCell) => {
+      const id = String(yCell.get("id") ?? generateId());
+      const type = asCellType(yCell.get("type"));
+      const yText = yCell.get("content") as Y.Text | undefined;
+      const content = yText ? yText.toString() : "";
+      return { id, type, content, status: "idle" };
+    });
+
+    await saveNotebookAsync(notebookId, yTitle.toString() || "Untitled Notebook", snapshotCells, []);
+    setState((prev) => ({ ...prev, lastSaved: new Date(), isDirty: false }));
+  }, [notebookId]);
 
   return {
     ...state,
     kernelLoadingMessage,
     kernelKind,
+    collabAwareness,
+    collabStatus,
+    collabPeerCount,
+    getCellYText,
     setActiveCell,
     updateCellContent,
     addCell,
@@ -495,9 +787,6 @@ export function useNotebook() {
     interruptKernel,
     reconnectToKernel,
     getKernelKind,
-    reorderCells,
-    createNotebook,
-    loadNotebook,
     updateNotebookTitle,
     saveCurrentNotebook,
   };

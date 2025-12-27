@@ -1,5 +1,5 @@
 import { useState, useEffect } from 'react';
-import { Keyboard, Monitor, Code, Server, RefreshCw } from 'lucide-react';
+import { Keyboard, Monitor, Code, Server, RefreshCw, Users } from 'lucide-react';
 import {
   Dialog,
   DialogContent,
@@ -20,7 +20,51 @@ export interface NotebookSettings {
   autoSaveInterval: number;
   backendKernelUrl: string;
   kernelMode: KernelMode; // Strict mode selection: 'backend' or 'pyodide'
+  collabEnabled: boolean;
+  collabServerUrl: string;
+  collabToken: string;
+  collabConnectTimeoutMs: number;
 }
+
+function isLocalHostname(hostname: string): boolean {
+  if (!hostname) return false;
+  const normalized = hostname.toLowerCase();
+  return (
+    normalized === 'localhost' ||
+    normalized === '127.0.0.1' ||
+    normalized === '::1' ||
+    normalized === '[::1]' ||
+    normalized.endsWith('.localhost')
+  );
+}
+
+function shouldIgnoreEnvBackendUrl(envUrl: string): boolean {
+  if (!envUrl) return false;
+  try {
+    const parsed = new URL(envUrl);
+    if (!isLocalHostname(parsed.hostname)) return false;
+    const runtimeHost = typeof window !== 'undefined' ? window.location.hostname : '';
+    return !isLocalHostname(runtimeHost);
+  } catch {
+    return false;
+  }
+}
+
+const rawEnvBackendKernelUrl = (import.meta.env.VITE_BACKEND_KERNEL_URL ?? '').trim().replace(/\/$/, '');
+const envBackendKernelUrl = shouldIgnoreEnvBackendUrl(rawEnvBackendKernelUrl) ? '' : rawEnvBackendKernelUrl;
+const envDefaultKernelMode = import.meta.env.VITE_DEFAULT_KERNEL_MODE;
+const inferredKernelMode: KernelMode =
+  envDefaultKernelMode === 'backend' || envDefaultKernelMode === 'pyodide'
+    ? envDefaultKernelMode
+    : envBackendKernelUrl
+      ? 'backend'
+      : 'pyodide';
+
+const envCollabWsUrl = (import.meta.env.VITE_COLLAB_WS_URL ?? '').trim();
+const envCollabToken = (import.meta.env.VITE_COLLAB_TOKEN ?? '').trim();
+const envCollabTimeoutRaw = (import.meta.env.VITE_COLLAB_CONNECT_TIMEOUT_MS ?? '').trim();
+const envCollabTimeout = envCollabTimeoutRaw ? Number(envCollabTimeoutRaw) : NaN;
+const envCollabConnectTimeoutMs = Number.isFinite(envCollabTimeout) ? Math.max(0, Math.floor(envCollabTimeout)) : 2000;
 
 const defaultSettings: NotebookSettings = {
   fontSize: 14,
@@ -28,8 +72,12 @@ const defaultSettings: NotebookSettings = {
   wordWrap: true,
   lineNumbers: true,
   autoSaveInterval: 30,
-  backendKernelUrl: '', // Will be auto-detected or set by user
-  kernelMode: 'backend', // Default to backend (supports pip install, etc.)
+  backendKernelUrl: envBackendKernelUrl, // Default from env (optional)
+  kernelMode: inferredKernelMode,
+  collabEnabled: !!envCollabWsUrl,
+  collabServerUrl: envCollabWsUrl,
+  collabToken: envCollabToken,
+  collabConnectTimeoutMs: envCollabConnectTimeoutMs,
 };
 
 interface SettingsDialogProps {
@@ -289,7 +337,8 @@ export function SettingsDialog({
                     className="w-full font-code text-sm bg-secondary border border-[var(--jupyter-border)] rounded px-3 py-2 text-foreground placeholder:text-muted-foreground/50"
                   />
                   <p className="font-ui text-xs text-muted-foreground">
-                    URL of your Python kernel server
+                    URL of your Python kernel server (e.g. <span className="font-code">https://your-backend.com</span>).
+                    Do not use the collaboration Worker URL (<span className="font-code">/ws</span>).
                   </p>
                 </div>
               )}
@@ -333,6 +382,87 @@ export function SettingsDialog({
                   </p>
                 )}
               </div>
+            </div>
+          </div>
+
+          <Separator className="bg-[var(--jupyter-border)]" />
+
+          {/* Collaboration Settings */}
+          <div>
+            <div className="flex items-center gap-2 mb-3">
+              <Users className="w-4 h-4 text-[var(--jupyter-accent)]" />
+              <h3 className="font-ui text-sm font-medium text-foreground">
+                Collaboration (Yjs)
+              </h3>
+            </div>
+            <div className="space-y-4">
+              <div className="flex items-center justify-between">
+                <Label htmlFor="collabEnabled" className="font-ui text-sm text-muted-foreground">
+                  Enable collaboration
+                </Label>
+                <Switch
+                  id="collabEnabled"
+                  checked={localSettings.collabEnabled}
+                  onCheckedChange={(checked) => handleChange('collabEnabled', checked)}
+                />
+              </div>
+
+              {localSettings.collabEnabled && (
+                <>
+                  <div className="space-y-2">
+                    <Label htmlFor="collabServerUrl" className="font-ui text-sm text-muted-foreground">
+                      Collab WebSocket URL
+                    </Label>
+                    <input
+                      id="collabServerUrl"
+                      type="text"
+                      value={localSettings.collabServerUrl}
+                      onChange={(e) => handleChange('collabServerUrl', e.target.value)}
+                      placeholder="e.g., wss://<your-worker-domain>/ws"
+                      className="w-full font-code text-sm bg-secondary border border-[var(--jupyter-border)] rounded px-3 py-2 text-foreground placeholder:text-muted-foreground/50"
+                    />
+                    <p className="font-ui text-xs text-muted-foreground">
+                      This is the Cloudflare Worker endpoint used for real-time sync (not code execution).
+                      Example: <span className="font-code">wss://your-worker.workers.dev/ws</span>
+                    </p>
+                  </div>
+
+                  <div className="space-y-2">
+                    <Label htmlFor="collabToken" className="font-ui text-sm text-muted-foreground">
+                      Collab token (optional)
+                    </Label>
+                    <input
+                      id="collabToken"
+                      type="password"
+                      value={localSettings.collabToken}
+                      onChange={(e) => handleChange('collabToken', e.target.value)}
+                      placeholder="token"
+                      className="w-full font-code text-sm bg-secondary border border-[var(--jupyter-border)] rounded px-3 py-2 text-foreground placeholder:text-muted-foreground/50"
+                    />
+                    <p className="font-ui text-xs text-muted-foreground">
+                      Sent as <span className="font-code">?token=...</span> when connecting. Avoid embedding secrets in a public frontend.
+                    </p>
+                  </div>
+
+                  <div className="flex items-center justify-between">
+                    <Label htmlFor="collabTimeout" className="font-ui text-sm text-muted-foreground">
+                      Connect timeout
+                    </Label>
+                    <select
+                      id="collabTimeout"
+                      value={localSettings.collabConnectTimeoutMs}
+                      onChange={(e) => handleChange('collabConnectTimeoutMs', Number(e.target.value))}
+                      className="font-ui text-sm bg-secondary border border-[var(--jupyter-border)] rounded px-2 py-1 text-foreground"
+                    >
+                      <option value={500}>0.5s</option>
+                      <option value={1000}>1s</option>
+                      <option value={2000}>2s</option>
+                      <option value={5000}>5s</option>
+                      <option value={10000}>10s</option>
+                    </select>
+                  </div>
+                </>
+              )}
             </div>
           </div>
         </div>
