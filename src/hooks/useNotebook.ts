@@ -5,7 +5,7 @@ import { Awareness } from "y-protocols/awareness";
 
 import type { KernelClient } from "@/lib/kernel-client";
 import { selectKernelClient, reconnectKernel } from "@/lib/kernel-manager";
-import { COLLAB_CONFIG_CHANGED_EVENT, getCollabConfig } from "@/lib/collab";
+import { COLLAB_CONFIG_CHANGED_EVENT, getCollabConfig, type CollabConfig } from "@/lib/collab";
 import { getNotebookAsync, saveNotebookAsync, setCurrentNotebookId } from "@/lib/notebook-storage";
 import type { Cell, CellOutput, CellType, NotebookState } from "@/types/notebook";
 
@@ -72,6 +72,85 @@ function ensureNotebookInitialized(doc: Y.Doc) {
   codeCell.set("content", new Y.Text("# Write Python code here\n# Shift+Enter to run"));
 
   cells.push([mdCell, codeCell]);
+}
+
+const DEFAULT_NOTEBOOK_TITLE = "Untitled Notebook";
+const DEFAULT_NOTEBOOK_MD = "# New Notebook\n\nWelcome! Share this URL to collaborate.";
+const DEFAULT_NOTEBOOK_CODE = "# Write Python code here\n# Shift+Enter to run";
+
+function looksLikeDefaultNotebookDoc(doc: Y.Doc): boolean {
+  const title = doc.getText("title").toString();
+  if (title !== DEFAULT_NOTEBOOK_TITLE) return false;
+
+  const cells = doc.getArray<Y.Map<unknown>>("cells");
+  if (cells.length !== 2) return false;
+
+  const cell0 = cells.get(0);
+  const cell1 = cells.get(1);
+  if (!cell0 || !cell1) return false;
+
+  const type0 = String(cell0.get("type") ?? "");
+  const type1 = String(cell1.get("type") ?? "");
+  if (type0 !== "markdown" || type1 !== "code") return false;
+
+  const text0 = cell0.get("content");
+  const text1 = cell1.get("content");
+  if (!(text0 instanceof Y.Text) || !(text1 instanceof Y.Text)) return false;
+
+  return text0.toString() === DEFAULT_NOTEBOOK_MD && text1.toString() === DEFAULT_NOTEBOOK_CODE;
+}
+
+function wsToHttpUrl(value: string): string {
+  if (value.startsWith("wss://")) return `https://${value.slice("wss://".length)}`;
+  if (value.startsWith("ws://")) return `http://${value.slice("ws://".length)}`;
+  return value;
+}
+
+function buildCollabHttpEndpoint(collab: CollabConfig, notebookId: string, suffix: string): string {
+  const base = wsToHttpUrl(collab.serverUrl).replace(/\/+$/, "");
+  const url = new URL(`${base}/${encodeURIComponent(notebookId)}/${suffix}`);
+
+  const params = collab.params ?? {};
+  for (const [key, val] of Object.entries(params)) {
+    if (typeof val === "string" && val) url.searchParams.set(key, val);
+  }
+
+  return url.toString();
+}
+
+async function tryFetchArrayBuffer(url: string, timeoutMs: number): Promise<ArrayBuffer | null> {
+  const controller = new AbortController();
+  const timer = window.setTimeout(() => controller.abort(), Math.max(0, Math.floor(timeoutMs)));
+  try {
+    const res = await fetch(url, { signal: controller.signal, cache: "no-store" });
+    if (!res.ok) return null;
+    return await res.arrayBuffer();
+  } catch {
+    return null;
+  } finally {
+    window.clearTimeout(timer);
+  }
+}
+
+async function tryApplyRemoteCollabSnapshot(
+  doc: Y.Doc,
+  collab: CollabConfig,
+  notebookId: string,
+  shouldAbort: () => boolean
+): Promise<boolean> {
+  const url = buildCollabHttpEndpoint(collab, notebookId, "snapshot");
+  const buf = await tryFetchArrayBuffer(url, collab.connectTimeoutMs);
+  if (!buf || shouldAbort()) return false;
+
+  try {
+    if (buf.byteLength > 0) {
+      Y.applyUpdate(doc, new Uint8Array(buf));
+    }
+    return true;
+  } catch (e) {
+    console.warn("Failed to apply collab snapshot:", e);
+    return false;
+  }
 }
 
 async function loadNotebookSnapshotIntoDoc(
@@ -257,6 +336,7 @@ export function useNotebook(notebookId: string) {
     ydocRef.current = doc;
     let disposed = false;
     let detachAwarenessListener: (() => void) | null = null;
+    let detachProviderListeners: (() => void) | null = null;
 
     let readyToMarkDirty = false;
     const onDocUpdate = () => {
@@ -298,7 +378,7 @@ export function useNotebook(notebookId: string) {
     }
 
     const provider = new WebsocketProvider(collab.serverUrl, notebookId, doc, {
-      connect: true,
+      connect: false,
       params: collab.params ?? {},
     });
     providerRef.current = provider;
@@ -317,53 +397,87 @@ export function useNotebook(notebookId: string) {
     setCollabAwareness(provider.awareness);
 
     let synced = false;
+    let seededFromStorage = false;
+    let initialSnapshotLoaded = false;
+    let syncTimeoutId: number | null = null;
+
     const onSync = (isSynced: boolean) => {
       if (!isSynced) return;
       synced = true;
       setCollabStatus("connected");
-      ensureNotebookInitialized(doc);
-      scheduleSyncFromDoc();
-      readyToMarkDirty = true;
+
+      // If this DO is still the default notebook, and we have a saved notebook in storage,
+      // seed the collaborative doc once (so backend/local notebooks can become collaborative).
+      if (!seededFromStorage && looksLikeDefaultNotebookDoc(doc)) {
+        void (async () => {
+          await loadNotebookSnapshotIntoDoc(doc, notebookId, () => disposed);
+          if (disposed) return;
+          seededFromStorage = true;
+          scheduleSyncFromDoc();
+        })();
+      }
+
+      if (syncTimeoutId != null) {
+        window.clearTimeout(syncTimeoutId);
+        syncTimeoutId = null;
+      }
+    };
+
+    const onStatus = (payload: unknown) => {
+      const status = (payload as { status?: string } | null)?.status;
+      if (status === "disconnected" && !synced) {
+        setCollabStatus((prev) => (prev === "connected" ? prev : prev));
+      }
     };
 
     provider.on("sync", onSync);
+    provider.on("status", onStatus);
+    detachProviderListeners = () => {
+      provider.off("sync", onSync);
+      provider.off("status", onStatus);
+    };
 
-    const fallbackTimer = window.setTimeout(() => {
+    syncTimeoutId = window.setTimeout(() => {
       if (synced) return;
-
-      provider.destroy();
-      providerRef.current = null;
-      detachAwarenessListener?.();
-      detachAwarenessListener = null;
+      // Don't tear anything down; just expose that we're running without confirmed realtime sync yet.
       setCollabStatus("fallback");
-
-      const localAwareness = new Awareness(doc);
-      try {
-        localAwareness.setLocalStateField("user", { name: "You" });
-      } catch {
-        // ignore
-      }
-      const syncLocalPeers = () => setCollabPeerCount(Math.max(1, localAwareness.getStates().size));
-      localAwareness.on("update", syncLocalPeers);
-      syncLocalPeers();
-      detachAwarenessListener = () => localAwareness.off("update", syncLocalPeers);
-      awarenessRef.current = localAwareness;
-      setCollabAwareness(localAwareness);
-
-      void loadNotebookSnapshotIntoDoc(doc, notebookId, () => disposed).then(() => {
-        if (disposed) return;
-        scheduleSyncFromDoc();
-        readyToMarkDirty = true;
-      });
     }, collab.connectTimeoutMs);
 
-    scheduleSyncFromDoc();
+    void (async () => {
+      // Best-effort: load a snapshot over HTTP first. This avoids "some notebooks never sync" when the WS handshake is slow,
+      // and ensures the initial doc matches the Durable Object before enabling edits.
+      const appliedRemote = await tryApplyRemoteCollabSnapshot(doc, collab, notebookId, () => disposed);
+      if (disposed) return;
+      initialSnapshotLoaded = true;
+
+      // If the remote doc is still the default notebook, try seeding it from storage.
+      if (looksLikeDefaultNotebookDoc(doc)) {
+        const saved = await getNotebookAsync(notebookId);
+        if (disposed) return;
+        if (saved) {
+          await loadNotebookSnapshotIntoDoc(doc, notebookId, () => disposed);
+          if (disposed) return;
+          seededFromStorage = true;
+        }
+      }
+
+      // If snapshot fetch failed, show offline mode until WS sync succeeds.
+      if (!appliedRemote) setCollabStatus("fallback");
+
+      ensureNotebookInitialized(doc);
+      scheduleSyncFromDoc();
+      readyToMarkDirty = true;
+
+      // Now connect websockets (realtime).
+      provider.connect();
+    })();
 
     return () => {
       disposed = true;
-      window.clearTimeout(fallbackTimer);
+      if (syncTimeoutId != null) window.clearTimeout(syncTimeoutId);
       doc.off("update", onDocUpdate);
       detachAwarenessListener?.();
+      detachProviderListeners?.();
       provider.destroy();
       doc.destroy();
     };

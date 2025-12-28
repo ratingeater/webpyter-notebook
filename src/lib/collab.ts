@@ -73,7 +73,7 @@ export function getCollabConfig(): CollabConfig | null {
   const timeoutRaw = (import.meta.env.VITE_COLLAB_CONNECT_TIMEOUT_MS as string | undefined)?.trim() ?? "";
   const timeoutEnv = timeoutRaw ? Number(timeoutRaw) : NaN;
   const timeoutEffective =
-    runtimeTimeout != null ? runtimeTimeout : Number.isFinite(timeoutEnv) ? timeoutEnv : 2000;
+    runtimeTimeout != null ? runtimeTimeout : Number.isFinite(timeoutEnv) ? timeoutEnv : 10000;
   const connectTimeoutMs = Math.max(0, Math.floor(timeoutEffective));
 
   return { serverUrl, params, connectTimeoutMs };

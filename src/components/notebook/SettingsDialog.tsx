@@ -64,7 +64,7 @@ const envCollabWsUrl = (import.meta.env.VITE_COLLAB_WS_URL ?? '').trim();
 const envCollabToken = (import.meta.env.VITE_COLLAB_TOKEN ?? '').trim();
 const envCollabTimeoutRaw = (import.meta.env.VITE_COLLAB_CONNECT_TIMEOUT_MS ?? '').trim();
 const envCollabTimeout = envCollabTimeoutRaw ? Number(envCollabTimeoutRaw) : NaN;
-const envCollabConnectTimeoutMs = Number.isFinite(envCollabTimeout) ? Math.max(0, Math.floor(envCollabTimeout)) : 2000;
+const envCollabConnectTimeoutMs = Number.isFinite(envCollabTimeout) ? Math.max(0, Math.floor(envCollabTimeout)) : 10000;
 
 const defaultSettings: NotebookSettings = {
   fontSize: 14,

@@ -740,7 +740,8 @@ def save_notebook_file(notebook_id: str, data: dict) -> Path:
     for cell in data.get('cells', []):
         nb_cell = {
             "cell_type": cell.get('type', 'code'),
-            "metadata": {},
+            # Preserve stable cell ids for collaboration/state sync.
+            "metadata": {"id": cell.get('id')} if cell.get('id') else {},
             "source": cell.get('content', '').split('\n'),
         }
         if cell.get('type') == 'code':
@@ -785,8 +786,14 @@ def load_notebook_file(notebook_id: str) -> Optional[dict]:
         
         cells = []
         for nb_cell in nb.get('cells', []):
+            meta = nb_cell.get('metadata', {}) or {}
+            cell_id = meta.get('id')
+            if cell_id:
+                cell_id = str(cell_id)
+            else:
+                cell_id = str(hash(str(nb_cell.get('source', ''))))[:8]
             cell = {
-                'id': str(hash(str(nb_cell.get('source', ''))))[:8],
+                'id': cell_id,
                 'type': nb_cell.get('cell_type', 'code'),
                 'content': '\n'.join(nb_cell.get('source', [])) if isinstance(nb_cell.get('source'), list) else nb_cell.get('source', ''),
                 'status': 'idle',
