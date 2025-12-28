@@ -8,16 +8,21 @@ export interface Env {
 export { NotebookDO };
 
 function withCors(response: Response): Response {
-  const headers = new Headers(response.headers);
-  headers.set("Access-Control-Allow-Origin", "*");
-  headers.set("Access-Control-Allow-Headers", "Content-Type, Upgrade, Sec-WebSocket-Protocol");
-  headers.set("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
-  return new Response(response.body, { ...response, headers });
+  const res = new Response(response.body, response);
+  res.headers.set("Access-Control-Allow-Origin", "*");
+  res.headers.set(
+    "Access-Control-Allow-Headers",
+    "Content-Type, Upgrade, Sec-WebSocket-Protocol"
+  );
+  res.headers.set("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+  return res;
 }
 
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
+    const isWebSocket =
+      (request.headers.get("Upgrade") ?? "").toLowerCase() === "websocket";
 
     if (request.method === "OPTIONS") {
       return withCors(new Response(null, { status: 204 }));
@@ -40,7 +45,10 @@ export default {
       const notebookId = parts[1];
       const id = env.NOTEBOOK_DO.idFromName(notebookId);
       const stub = env.NOTEBOOK_DO.get(id);
-      return stub.fetch(request);
+      const response = await stub.fetch(request);
+      // WebSockets don't use CORS; only attach CORS headers for HTTP fetches (e.g. /snapshot).
+      if (isWebSocket) return response;
+      return withCors(response);
     }
 
     return withCors(

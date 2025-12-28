@@ -78,6 +78,38 @@ const DEFAULT_NOTEBOOK_TITLE = "Untitled Notebook";
 const DEFAULT_NOTEBOOK_MD = "# New Notebook\n\nWelcome! Share this URL to collaborate.";
 const DEFAULT_NOTEBOOK_CODE = "# Write Python code here\n# Shift+Enter to run";
 
+const COLLAB_HEARTBEAT_MS = 15_000;
+const COLLAB_STALE_MS = 60_000;
+
+function getActiveAwarenessClientIds(awareness: Awareness | null, localClientId: number): number[] {
+  if (!awareness) return [];
+
+  const states = awareness.getStates();
+  const meta = (awareness as unknown as { meta?: Map<number, { lastUpdated?: number }> }).meta;
+  const now = Date.now();
+
+  const ids: number[] = [];
+  for (const id of states.keys()) {
+    if (id === localClientId) {
+      ids.push(id);
+      continue;
+    }
+
+    const lastUpdated = meta?.get?.(id)?.lastUpdated;
+    if (typeof lastUpdated === "number" && now - lastUpdated > COLLAB_STALE_MS) continue;
+
+    ids.push(id);
+  }
+
+  return ids;
+}
+
+function getAwarenessPeerCount(awareness: Awareness | null, localClientId: number): number {
+  if (!awareness) return 1;
+  const active = getActiveAwarenessClientIds(awareness, localClientId);
+  return Math.max(1, active.length || awareness.getStates().size || 1);
+}
+
 function looksLikeDefaultNotebookDoc(doc: Y.Doc): boolean {
   const title = doc.getText("title").toString();
   if (title !== DEFAULT_NOTEBOOK_TITLE) return false;
@@ -179,9 +211,13 @@ async function loadNotebookSnapshotIntoDoc(
     const yCells = doc.getArray<Y.Map<unknown>>("cells");
     if (yCells.length > 0) yCells.delete(0, yCells.length);
 
+    const usedIds = new Set<string>();
     const nextCells = saved.cells.map((cell) => {
+      let id = cell.id || generateId();
+      if (usedIds.has(id)) id = generateId();
+      usedIds.add(id);
       const yCell = new Y.Map<unknown>();
-      yCell.set("id", cell.id || generateId());
+      yCell.set("id", id);
       yCell.set("type", cell.type);
       yCell.set("content", new Y.Text(cell.content || ""));
       return yCell;
@@ -362,7 +398,7 @@ export function useNotebook(notebookId: string) {
       } catch {
         // ignore
       }
-      const syncPeers = () => setCollabPeerCount(Math.max(1, localAwareness.getStates().size));
+      const syncPeers = () => setCollabPeerCount(getAwarenessPeerCount(localAwareness, doc.clientID));
       localAwareness.on("update", syncPeers);
       syncPeers();
       detachAwarenessListener = () => localAwareness.off("update", syncPeers);
@@ -395,10 +431,29 @@ export function useNotebook(notebookId: string) {
     } catch {
       // ignore
     }
-    const syncPeers = () => setCollabPeerCount(Math.max(1, provider.awareness.getStates().size));
+
+    // Heartbeat helps avoid ghost peers when clients disconnect uncleanly (and powers leader election).
+    let heartbeatId: number | null = null;
+    try {
+      provider.awareness.setLocalStateField("hb", Date.now());
+      heartbeatId = window.setInterval(() => {
+        try {
+          provider.awareness.setLocalStateField("hb", Date.now());
+        } catch {
+          // ignore
+        }
+      }, COLLAB_HEARTBEAT_MS);
+    } catch {
+      // ignore
+    }
+
+    const syncPeers = () => setCollabPeerCount(getAwarenessPeerCount(provider.awareness, doc.clientID));
     provider.awareness.on("update", syncPeers);
     syncPeers();
-    detachAwarenessListener = () => provider.awareness.off("update", syncPeers);
+    detachAwarenessListener = () => {
+      provider.awareness.off("update", syncPeers);
+      if (heartbeatId != null) window.clearInterval(heartbeatId);
+    };
 
     awarenessRef.current = provider.awareness;
     setCollabAwareness(provider.awareness);
@@ -539,7 +594,7 @@ export function useNotebook(notebookId: string) {
       // Collaboration push principle: avoid having every peer hammer the backend.
       // Only the "leader" (lowest awareness client id) performs backend persistence.
       const awareness = awarenessRef.current;
-      const ids = awareness ? Array.from(awareness.getStates().keys()) : [];
+      const ids = getActiveAwarenessClientIds(awareness, doc.clientID);
       const leaderId = ids.length > 0 ? Math.min(...ids) : doc.clientID;
       const isLeader = leaderId === doc.clientID;
 

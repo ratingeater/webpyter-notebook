@@ -48,6 +48,12 @@ npm run ui:smoke
 
 By default it uses `msedge` on Windows; override with `PLAYWRIGHT_CHANNEL` or `PLAYWRIGHT_EXECUTABLE_PATH`.
 
+Smoke-test collaboration end-to-end in a real browser (starts local Worker+DO + Vite preview):
+
+```bash
+npm run ui:smoke:collab
+```
+
 ### Deploy to Cloudflare
 
 #### 1) Deploy the Worker + Durable Object

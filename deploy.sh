@@ -174,6 +174,9 @@ start_frontend() {
     # Configure collab websocket URL only when enabled
     if [ "$ENABLE_COLLAB" = "1" ]; then
         upsert_env_var "VITE_COLLAB_WS_URL" "ws://localhost:$WORKER_PORT/ws"
+    else
+        # Ensure stale env doesn't keep collab enabled when the local Worker isn't running.
+        upsert_env_var "VITE_COLLAB_WS_URL" ""
     fi
     
     # Start frontend

@@ -193,13 +193,13 @@ export function createNewNotebook(): SavedNotebook {
       id: Math.random().toString(36).substring(2, 11),
       type: 'markdown',
       content:
-        '# New Notebook\n\nWelcome to your new notebook! Start writing code below.',
+        '# New Notebook\n\nWelcome! Share this URL to collaborate.',
       status: 'idle',
     },
     {
       id: Math.random().toString(36).substring(2, 11),
       type: 'code',
-      content: '# Write your Python code here\n# Press Shift+Enter to execute',
+      content: '# Write Python code here\n# Shift+Enter to run',
       status: 'idle',
     },
   ];

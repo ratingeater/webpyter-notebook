@@ -68,6 +68,7 @@ async function run() {
   const notebookUrl = `${baseUrl}/n/${encodeURIComponent(notebookId)}`;
 
   const badBackendUrl = process.env.BAD_BACKEND_URL || "http://127.0.0.1:8787";
+  const shouldStartWorker = !process.env.BAD_BACKEND_URL && badBackendUrl === "http://127.0.0.1:8787";
 
   const viteEnv = {
     ...process.env,
@@ -75,6 +76,15 @@ async function run() {
     VITE_BACKEND_KERNEL_URL: badBackendUrl,
     VITE_COLLAB_WS_URL: "",
   };
+
+  // If we didn't explicitly set BAD_BACKEND_URL, start a local collab worker to ensure we hit the "wrong backend" case.
+  // (Otherwise the URL may just be unreachable and the test won't exercise the collab-worker detection path.)
+  const worker = shouldStartWorker
+    ? spawnNpm(
+        ["run", "-s", "worker:dev", "--", "--local", "--port", "8787", "--show-interactive-dev-session", "false"],
+        { stdio: "inherit", env: process.env }
+      )
+    : null;
 
   {
     const build = spawnNpm(["run", "-s", "build"], { stdio: "inherit", env: viteEnv });
@@ -89,6 +99,9 @@ async function run() {
 
   let browser;
   try {
+    if (worker) {
+      await waitForHttpOk("http://127.0.0.1:8787/api/health", 30_000);
+    }
     await waitForHttpOk(baseUrl, 30_000);
 
     const launchOptions = resolveBrowserLaunchOptions();
@@ -126,6 +139,7 @@ async function run() {
       // ignore
     }
     await killProcessTree(server);
+    await killProcessTree(worker);
   }
 }
 
@@ -134,4 +148,3 @@ run().catch((err) => {
   console.error(err);
   process.exit(1);
 });
-

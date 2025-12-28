@@ -49,6 +49,56 @@ function initDefaultNotebook(doc: Y.Doc) {
   cells.push([mdCell, codeCell]);
 }
 
+function sanitizeNotebookCells(doc: Y.Doc): boolean {
+  const cells = doc.getArray<Y.Map<unknown>>("cells");
+  const usedIds = new Set<string>();
+  let mutated = false;
+
+  doc.transact(() => {
+    for (let i = 0; i < cells.length; i++) {
+      const cell = cells.get(i);
+      if (!(cell instanceof Y.Map)) continue;
+
+      const rawId = cell.get("id");
+      let id =
+        typeof rawId === "string"
+          ? rawId
+          : rawId == null
+            ? ""
+            : String(rawId);
+      id = id.trim();
+
+      if (!id || usedIds.has(id)) {
+        let next = randomId();
+        while (usedIds.has(next)) next = randomId();
+        cell.set("id", next);
+        id = next;
+        mutated = true;
+      } else if (rawId !== id) {
+        cell.set("id", id);
+        mutated = true;
+      }
+
+      usedIds.add(id);
+
+      const rawType = cell.get("type");
+      if (rawType !== "code" && rawType !== "markdown") {
+        cell.set("type", "code" satisfies CellType);
+        mutated = true;
+      }
+
+      const rawContent = cell.get("content");
+      if (!(rawContent instanceof Y.Text)) {
+        const nextContent = typeof rawContent === "string" ? rawContent : "";
+        cell.set("content", new Y.Text(nextContent));
+        mutated = true;
+      }
+    }
+  });
+
+  return mutated;
+}
+
 export class NotebookDO {
   private readonly state: DurableObjectState;
   private readonly doc: Y.Doc;
@@ -106,12 +156,15 @@ export class NotebookDO {
         await this.persistSnapshot();
       }
 
+      const sanitized = sanitizeNotebookCells(this.doc);
+      if (sanitized) await this.persistSnapshot();
+
       this.initializing = false;
     });
   }
 
   async fetch(request: Request): Promise<Response> {
-    if (request.headers.get("Upgrade") === "websocket") {
+    if ((request.headers.get("Upgrade") ?? "").toLowerCase() === "websocket") {
       return this.handleWebSocket();
     }
 
@@ -144,6 +197,10 @@ export class NotebookDO {
   }
 
   private handleWebSocket(): Response {
+    // Best-effort: keep cell ids unique/stable even for docs created by older clients.
+    // Doing this before accepting the socket ensures the new client receives the sanitized state in sync step 1.
+    sanitizeNotebookCells(this.doc);
+
     const pair = new WebSocketPair();
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const [client, server] = Object.values(pair) as any as [WebSocket, WebSocket];

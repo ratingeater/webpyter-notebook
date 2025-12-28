@@ -10,7 +10,7 @@ import { AddCellButton } from './AddCellButton';
 import { PlotViewer } from './PlotViewer';
 import { SettingsDialog, type NotebookSettings, defaultSettings } from './SettingsDialog';
 import { CellType, CellOutput } from '@/types/notebook';
-import { generateNotebookId } from "@/lib/notebook-storage";
+import { createNewNotebook, saveNotebookAsync } from "@/lib/notebook-storage";
 import { notifyCollabConfigChanged } from "@/lib/collab";
 
 export function Notebook({ notebookId }: { notebookId: string }) {
@@ -156,19 +156,23 @@ export function Notebook({ notebookId }: { notebookId: string }) {
       )}
 
       {/* Header */}
-      <Header
-        notebookTitle={notebookTitle}
-        cells={cells}
-        onRunAll={handleRunAll}
-        onRestartKernel={restartKernel}
-        onInterruptKernel={interruptKernel}
-        onToggleSidebar={() => setIsSidebarVisible(!isSidebarVisible)}
-        onToggleVariables={() => setIsVariablesVisible(!isVariablesVisible)}
-        onNewNotebook={() => navigate(`/n/${generateNotebookId()}`)}
-        onLoadNotebook={(id) => navigate(`/n/${id}`)}
-        onSave={saveCurrentNotebook}
-        onTitleChange={updateNotebookTitle}
-        onOpenSettings={() => setIsSettingsOpen(true)}
+        <Header
+          notebookTitle={notebookTitle}
+          cells={cells}
+          onRunAll={handleRunAll}
+          onRestartKernel={restartKernel}
+          onInterruptKernel={interruptKernel}
+          onToggleSidebar={() => setIsSidebarVisible(!isSidebarVisible)}
+          onToggleVariables={() => setIsVariablesVisible(!isVariablesVisible)}
+          onNewNotebook={() => {
+            const nb = createNewNotebook();
+            void saveNotebookAsync(nb.metadata.id, nb.metadata.title, nb.cells, []);
+            navigate(`/n/${nb.metadata.id}`);
+          }}
+          onLoadNotebook={(id) => navigate(`/n/${id}`)}
+          onSave={saveCurrentNotebook}
+          onTitleChange={updateNotebookTitle}
+          onOpenSettings={() => setIsSettingsOpen(true)}
         isSidebarVisible={isSidebarVisible}
         isVariablesVisible={isVariablesVisible}
         isKernelBusy={kernelStatus === 'busy'}

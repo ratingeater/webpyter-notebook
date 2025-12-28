@@ -34,3 +34,8 @@ core
 .github/
 
 **/tempobook/**
+
+# Python caches (backend)
+__pycache__/
+*.pyc
+.pytest_cache/

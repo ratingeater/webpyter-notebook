@@ -16,6 +16,7 @@ import subprocess
 import re
 import tempfile
 import shutil
+import uuid
 from pathlib import Path
 from contextlib import redirect_stdout, redirect_stderr
 from typing import Any, Dict, List, Optional, Tuple
@@ -783,15 +784,40 @@ def load_notebook_file(notebook_id: str) -> Optional[dict]:
     
     try:
         nb = json.loads(filepath.read_text())
+
+        used_ids = set()
+        migrated = False
         
         cells = []
         for nb_cell in nb.get('cells', []):
             meta = nb_cell.get('metadata', {}) or {}
+
+            # Prefer stable per-cell ids stored in metadata.id (used by collaboration/state sync).
             cell_id = meta.get('id')
-            if cell_id:
-                cell_id = str(cell_id)
+            if cell_id is not None and str(cell_id).strip():
+                cell_id = str(cell_id).strip()
             else:
-                cell_id = str(hash(str(nb_cell.get('source', ''))))[:8]
+                cell_id = None
+
+            # Ensure ids are unique and stable; avoid content-hash ids (can collide and vary between runs).
+            if not cell_id or cell_id in used_ids:
+                migrated = True
+                while True:
+                    candidate = uuid.uuid4().hex
+                    if candidate not in used_ids:
+                        cell_id = candidate
+                        break
+
+            used_ids.add(cell_id)
+
+            # Persist ids back into the notebook so subsequent loads are stable.
+            if not isinstance(meta, dict):
+                meta = {}
+            if meta.get('id') != cell_id:
+                meta['id'] = cell_id
+                nb_cell['metadata'] = meta
+                migrated = True
+
             cell = {
                 'id': cell_id,
                 'type': nb_cell.get('cell_type', 'code'),
@@ -824,6 +850,12 @@ def load_notebook_file(notebook_id: str) -> Optional[dict]:
                     }
             
             cells.append(cell)
+
+        if migrated:
+            try:
+                filepath.write_text(json.dumps(nb, indent=2))
+            except Exception as e:
+                print(f"Warning: failed to persist migrated cell ids: {e}")
         
         return {
             'id': notebook_id,
