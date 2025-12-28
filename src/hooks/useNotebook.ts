@@ -6,7 +6,7 @@ import { Awareness } from "y-protocols/awareness";
 import type { KernelClient } from "@/lib/kernel-client";
 import { selectKernelClient, reconnectKernel } from "@/lib/kernel-manager";
 import { COLLAB_CONFIG_CHANGED_EVENT, getCollabConfig, type CollabConfig } from "@/lib/collab";
-import { getNotebookAsync, saveNotebookAsync, setCurrentNotebookId } from "@/lib/notebook-storage";
+import { getNotebookAsync, saveNotebook, saveNotebookAsync, setCurrentNotebookId } from "@/lib/notebook-storage";
 import type { Cell, CellOutput, CellType, NotebookState } from "@/types/notebook";
 
 type RuntimeCellState = {
@@ -531,7 +531,21 @@ export function useNotebook(notebookId: string) {
         return { id, type, content, status: "idle" };
       });
 
-      void saveNotebookAsync(notebookId, yTitle.toString() || "Untitled Notebook", snapshotCells, []);
+      const title = yTitle.toString() || "Untitled Notebook";
+
+      // Always keep a local backup on every client.
+      saveNotebook(notebookId, title, snapshotCells, []);
+
+      // Collaboration push principle: avoid having every peer hammer the backend.
+      // Only the "leader" (lowest awareness client id) performs backend persistence.
+      const awareness = awarenessRef.current;
+      const ids = awareness ? Array.from(awareness.getStates().keys()) : [];
+      const leaderId = ids.length > 0 ? Math.min(...ids) : doc.clientID;
+      const isLeader = leaderId === doc.clientID;
+
+      if (isLeader) {
+        void saveNotebookAsync(notebookId, title, snapshotCells, []);
+      }
 
       setState((prev) => ({
         ...prev,
