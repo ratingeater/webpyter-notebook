@@ -121,6 +121,7 @@ Backend (Cloudflare Worker + Durable Objects)
 ## Notes
 
 - Durable Objects are used only for CRDT sync/persistence, not for executing Python code.
+- In collab mode, periodic backend notebook persistence is performed by a single peer (leader) to avoid write storms.
 - Durable Object storage has a 2MB value limit per key; this implementation stores a single Yjs snapshot and is best suited for small-to-medium notebooks.
 - The legacy `backend/` Python kernel server is not deployable on Cloudflare Workers; run it elsewhere if you need full Python with `pip`.
 - `VITE_COLLAB_TOKEN` is suitable for local testing; for real auth, use a user/session-based approach (a shared token embedded in a public frontend is not secret).
