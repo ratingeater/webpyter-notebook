@@ -97,7 +97,13 @@ function looksLikeDefaultNotebookDoc(doc: Y.Doc): boolean {
   const text1 = cell1.get("content");
   if (!(text0 instanceof Y.Text) || !(text1 instanceof Y.Text)) return false;
 
-  return text0.toString() === DEFAULT_NOTEBOOK_MD && text1.toString() === DEFAULT_NOTEBOOK_CODE;
+  const md = text0.toString().trim();
+  const code = text1.toString().trim();
+
+  const mdLooksDefault = md === DEFAULT_NOTEBOOK_MD || md.startsWith("# New Notebook");
+  const codeLooksDefault = code === DEFAULT_NOTEBOOK_CODE || code.startsWith("# Write Python code here");
+
+  return mdLooksDefault && codeLooksDefault;
 }
 
 function wsToHttpUrl(value: string): string {
@@ -157,12 +163,12 @@ async function loadNotebookSnapshotIntoDoc(
   doc: Y.Doc,
   notebookId: string,
   shouldAbort?: () => boolean
-) {
+): Promise<boolean> {
   const saved = await getNotebookAsync(notebookId);
-  if (shouldAbort?.()) return;
+  if (shouldAbort?.()) return false;
   if (!saved) {
     ensureNotebookInitialized(doc);
-    return;
+    return false;
   }
 
   doc.transact(() => {
@@ -187,6 +193,7 @@ async function loadNotebookSnapshotIntoDoc(
   });
 
   ensureNotebookInitialized(doc);
+  return true;
 }
 
 export function useNotebook(notebookId: string) {
@@ -398,7 +405,6 @@ export function useNotebook(notebookId: string) {
 
     let synced = false;
     let seededFromStorage = false;
-    let initialSnapshotLoaded = false;
     let syncTimeoutId: number | null = null;
 
     const onSync = (isSynced: boolean) => {
@@ -410,9 +416,9 @@ export function useNotebook(notebookId: string) {
       // seed the collaborative doc once (so backend/local notebooks can become collaborative).
       if (!seededFromStorage && looksLikeDefaultNotebookDoc(doc)) {
         void (async () => {
-          await loadNotebookSnapshotIntoDoc(doc, notebookId, () => disposed);
+          const seeded = await loadNotebookSnapshotIntoDoc(doc, notebookId, () => disposed);
           if (disposed) return;
-          seededFromStorage = true;
+          seededFromStorage = seeded;
           scheduleSyncFromDoc();
         })();
       }
@@ -423,18 +429,9 @@ export function useNotebook(notebookId: string) {
       }
     };
 
-    const onStatus = (payload: unknown) => {
-      const status = (payload as { status?: string } | null)?.status;
-      if (status === "disconnected" && !synced) {
-        setCollabStatus((prev) => (prev === "connected" ? prev : prev));
-      }
-    };
-
     provider.on("sync", onSync);
-    provider.on("status", onStatus);
     detachProviderListeners = () => {
       provider.off("sync", onSync);
-      provider.off("status", onStatus);
     };
 
     syncTimeoutId = window.setTimeout(() => {
@@ -448,21 +445,17 @@ export function useNotebook(notebookId: string) {
       // and ensures the initial doc matches the Durable Object before enabling edits.
       const appliedRemote = await tryApplyRemoteCollabSnapshot(doc, collab, notebookId, () => disposed);
       if (disposed) return;
-      initialSnapshotLoaded = true;
 
-      // If the remote doc is still the default notebook, try seeding it from storage.
-      if (looksLikeDefaultNotebookDoc(doc)) {
-        const saved = await getNotebookAsync(notebookId);
+      if (!appliedRemote) {
+        // Collab is unreachable right now; fall back to local/backend snapshot (but keep trying websockets).
+        setCollabStatus("fallback");
+        seededFromStorage = await loadNotebookSnapshotIntoDoc(doc, notebookId, () => disposed);
         if (disposed) return;
-        if (saved) {
-          await loadNotebookSnapshotIntoDoc(doc, notebookId, () => disposed);
-          if (disposed) return;
-          seededFromStorage = true;
-        }
+      } else if (looksLikeDefaultNotebookDoc(doc)) {
+        // Remote exists but is still the default notebook; seed it from storage if we have it.
+        seededFromStorage = await loadNotebookSnapshotIntoDoc(doc, notebookId, () => disposed);
+        if (disposed) return;
       }
-
-      // If snapshot fetch failed, show offline mode until WS sync succeeds.
-      if (!appliedRemote) setCollabStatus("fallback");
 
       ensureNotebookInitialized(doc);
       scheduleSyncFromDoc();
